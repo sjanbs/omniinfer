@@ -51,6 +51,7 @@ def vllm_config(base_config):
     scheduler_config = MagicMock(spec=SchedulerConfig)
     scheduler_config.max_num_seqs = 4
     scheduler_config.max_num_batched_tokens = 2048
+    scheduler_config.max_batch_size = 64
     scheduler_config.preemption_mode = None
 
     device_config = DeviceConfig(device=current_platform.device_type)
