@@ -17,7 +17,7 @@ from omni.layers.attention.deepseek_mla import DeepseekMLA
 
 class Test_DeepseekV32_MLA(TestCase):
     @patch("vllm.distributed.get_tensor_model_parallel_world_size",
-           return_value=8)
+    return_value=8)
     @patch('vllm.distributed.parallel_state._DP',
     new_callable=lambda: MagicMock(spec=GroupCoordinator))
     @patch('vllm.distributed.parallel_state._TP',
