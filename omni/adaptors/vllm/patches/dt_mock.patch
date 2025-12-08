@@ -1,0 +1,24 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index b8d9bc39d..1ef87f1fa 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@ import copy
+ import gc
+ import time
+ import weakref
++import os
+ from typing import TYPE_CHECKING, Optional, Union
+ 
+ import numpy as np
+@@ -197,8 +198,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.vllm_config.compilation_config.cudagraph_capture_sizes))
+ 
+         # Cache the device properties.
+-        self.device_properties = torch.cuda.get_device_properties(self.device)
+-        self.num_sms = self.device_properties.multi_processor_count
++        if not int(os.getenv("NO_NPU_MOCK", "0")):
++            self.device_properties = torch.cuda.get_device_properties(self.device)
++            self.num_sms = self.device_properties.multi_processor_count
+ 
+         # Persistent buffers for CUDA graphs.
+         self.input_ids = torch.zeros(self.max_num_tokens,
