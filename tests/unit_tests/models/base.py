@@ -23,7 +23,6 @@ from omni.adaptors.vllm.forward_context import set_forward_context
 from omni.layers.attention.backend.attention import AscendAttentionState
 from omni.layers.attention.backend.attention_dummy_builder import DummyAttentionMetadataBuilder
 
-from omni.layers.attention.backend.mla import AscendMLADecodeMetadata, AscendMLAMetadata
 from omni.adaptors.vllm.worker.npu_model_runner import GraphCompileConfiguration, mark_static_for_graph_default
 
 __origin_get_device_properties__ = torch.npu.get_device_properties
@@ -248,52 +247,6 @@ class MockRunner:
         self.init_attn_backends()
         # alloc kv cache tensor
         self.initialize_kv_cache()
-
-    def generate_activate_mask(self, actual_seqs_num, batch_size):
-        self.mc2_mask.zero_()
-        self.mc2_mask[:actual_seqs_num].fill_(True)
-
-    def build_dummy_metadata(self, num_tokens, max_batch_size, model):
-        input_positions = torch.zeros(max_batch_size,
-                                  dtype=torch.int64,
-                                  device=self.device)
-        slot_mapping = torch.zeros(max_batch_size,
-                                dtype=torch.int64,
-                                device=self.device)
-        graph_block_tables = torch.zeros((max_batch_size, (self.vllm_config.model_config.max_model_len + self.vllm_config.cache_config.block_size - 1) // self.vllm_config.cache_config.block_size))
-        block_table = graph_block_tables.to(
-            device=self.device,
-            dtype=torch.int32
-        )
-
-        seq_lens = torch.ones(max_batch_size, dtype=torch.long, device=self.device, pin_memory=True) * 2
-        first_layer_ind = model.model.start_layer
-        if isinstance(model.model.layers[first_layer_ind].self_attn, torch.nn.ModuleList):
-            cos, sin = model.model.layers[first_layer_ind].self_attn[0].rotary_emb.get_cos_sin(input_positions)
-        else:
-            cos, sin = model.model.layers[first_layer_ind].self_attn.rotary_emb.get_cos_sin(input_positions)
-        best_topk = None
-        self.generate_activate_mask(0, max_batch_size)
-        decode_metadata = AscendMLADecodeMetadata(
-                input_positions=input_positions,
-                block_table=block_table,
-                seq_lens=seq_lens,
-                mc2_mask=self.mc2_mask,
-                cos=cos,
-                sin=sin,
-                best_topk=best_topk)
-        return AscendMLAMetadata(  # type: ignore
-            num_actual_tokens=num_tokens,
-            slot_mapping=slot_mapping,
-            num_decodes=num_tokens,
-            num_decode_tokens=num_tokens,
-            num_prefills=0,
-            attn_mask=None,
-            attn_state=AscendAttentionState.DecodeOnly,
-            prefill=None,
-            decode=decode_metadata,
-            omni_cache=None
-        )
 
     @torch.inference_mode()
     def _dummy_run(self, num_tokens: int, total_steps: int = 1):
