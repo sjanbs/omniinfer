@@ -19,6 +19,7 @@ def _persistent_worker_loop(rank: int, world_size: int, temp_file_path: str,
         #    This is the fix: Ensure config is correct before the layer class binds to it.
         from omni.models.config_loader.loader import model_extra_config
         model_extra_config.parall_config.dense_mlp_tp_size = world_size
+        model_extra_config.parall_config.o_proj_tp_size = world_size
 
         # 3. CRITICAL: Reload the layer module
         #    This forces the layer classes to re-read the configuration we just set.
