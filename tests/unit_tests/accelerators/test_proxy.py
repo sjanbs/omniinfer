@@ -75,6 +75,28 @@ def setup_proxy():
         )
         pytest.fail(error_msg)
 
+def teardown_proxy():
+    try:
+        cmd = [
+            "bash", proxy_script_path,
+            "--stop",
+        ]
+        print(f"\n[TEARDOWN] Stopping proxy with command: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"[TEARDOWN] Script succeeded. Output:\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        error_msg = (
+            f"Teardown script failed with exit code {e.returncode}.\n"
+            f"STDERR: {e.stderr}\n"
+            f"STDOUT: {e.stdout}"
+        )
+        pytest.fail(error_msg)
+
 def setup_vllm(is_prefill, node_num):
     env = os.environ.copy()
     env['VLLM_ENABLE_MC2'] = '0'
@@ -179,6 +201,7 @@ def setup_teardown():
     yield {"processes": processes, "log_files": log_files}
 
     # --- Teardown: Shut down all instances ---
+    teardown_proxy()
     print(f"\n[TEARDOWN] Shutting down {total_node_num} instances...")
     cleanup_subprocess()
 
