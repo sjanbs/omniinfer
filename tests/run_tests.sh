@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export COVERAGE_RCFILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.coveragerc"
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -55,7 +56,14 @@ case "${target}" in
     ;;
 esac
 
-cmd=(pytest "${marker_args[@]}" "${target_path}" "${extra_args[@]}")
+cmd=(
+  pytest 
+  "${marker_args[@]}" 
+  "${target_path}"
+  --cov-report=html
+  --cov-report=xml
+  "${extra_args[@]}"
+)
 
 if [[ -n "${reports_dir}" ]]; then
   mkdir -p "${reports_dir}"
