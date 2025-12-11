@@ -1,6 +1,7 @@
 from omni.adaptors.vllm.patches import model_patch
 import pytest
 import os
+import gc
 import torch
 import torch.multiprocessing as mp
 import tempfile
@@ -32,12 +33,21 @@ class Test_e2e_models():
             initialize_model_parallel(world_size, 1)
 
     def _model_runner(self, local_rank: int, world_size: int, model_info, enable_graph):
+
+        os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+        os.environ["TP_SOCKET_IFNAME"] = "enp23s0f3"
+        os.environ["VLLM_USE_V1"] = "1"
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
+
         self.vllm_config = creat_vllm_config(model_info.hf_config)
         print(f"{world_size=}, {local_rank=}, {self.vllm_config.model_config.use_mla=}, {id(self.vllm_config)=}")
         assert self.vllm_config.model_config.use_mla == True
 
         # Optional: update vllm_config
         self.vllm_config.npu_compilation_config.decode_gear_list = [self.vllm_config.scheduler_config.max_batch_size]
+        # enable graph compile
+        if enable_graph:
+            self.vllm_config.npu_compilation_config.level = CompilationLevel.DYNAMO_AS_IS
 
         # Optional: update model_extra_config
         model_extra_config.task_config.decode_gear_list = [self.vllm_config.scheduler_config.max_batch_size]
@@ -57,12 +67,9 @@ class Test_e2e_models():
             model_info.model_cls,
         )
 
-        # enable graph compile
-        if enable_graph:
-            self.vllm_config.npu_compilation_config.level = CompilationLevel.DYNAMO_AS_IS
-
         # profile run
         self.mock_runner._dummy_run(self.vllm_config.scheduler_config.max_batch_size)
+        gc.collect()
 
         # init kv_cache
         self.mock_runner.init_kv_cache()
@@ -70,6 +77,18 @@ class Test_e2e_models():
         # test forward dummy
         forward_results = self.mock_runner._dummy_run(self.vllm_config.scheduler_config.max_batch_size)
         print(f"{forward_results[0].shape=}, {forward_results[1].shape=}")
+        assert forward_results[0].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
+        assert forward_results[1].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.vocab_size])
+
+        # test forward prefill
+        forward_results = self.mock_runner.forward_prefill(model_info.prompt_token_ids, self.vllm_config.scheduler_config.max_batch_size)
+        assert forward_results[0].shape == torch.Size([len(model_info.prompt_token_ids), self.vllm_config.model_config.hf_config.hidden_size])
+        assert forward_results[1].shape == torch.Size([1, self.vllm_config.model_config.hf_config.vocab_size])
+
+        # test forward decode
+        num_tokens = 1 # without speculative tokens
+        forward_results = self.mock_runner.forward_decode(num_tokens, self.vllm_config.scheduler_config.max_batch_size)
+        print(f"forward_decode: {forward_results[0].shape=}, {forward_results[1].shape=}")
         assert forward_results[0].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
         assert forward_results[1].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.vocab_size])
 
@@ -91,3 +110,4 @@ class Test_e2e_models():
         finally:
             if os.path.exists(self.temp_file_path):
                 os.remove(self.temp_file_path)
+

@@ -3,10 +3,11 @@ import logging
 import weakref
 from typing import Dict
 import numpy as np
+from unittest.mock import MagicMock, Mock
 
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadataBuilder)
-from vllm.config import set_current_vllm_config, get_layers_from_vllm_config, CompilationLevel
+from vllm.config import set_current_vllm_config, get_layers_from_vllm_config, CompilationLevel, KVTransferConfig
 from vllm.attention.layer import Attention
 from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.attention import AttentionType, get_attn_backend
@@ -18,7 +19,9 @@ from vllm.utils import is_pin_memory_available, supports_dynamo
 from vllm.platforms import current_platform
 from vllm.v1.utils import bind_kv_cache
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype, process_weights_after_loading
-from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.block_table import BlockTable
 from omni.adaptors.vllm.forward_context import set_forward_context
 from omni.layers.attention.backend.attention import AscendAttentionState
 from omni.layers.attention.backend.attention_dummy_builder import DummyAttentionMetadataBuilder
@@ -49,6 +52,7 @@ class MockRunner:
         self.max_model_len = self.model_config.max_model_len
         self.max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs
         self.speculative_config = vllm_config.speculative_config
+        self.uses_mrope = False
         self.use_spec_decode = False
         if self.speculative_config:
             self.use_spec_decode = True
@@ -60,7 +64,6 @@ class MockRunner:
         self.drafter_mark_static = False
         self.dummy_drafter_mark_static = False
         self.pin_memory = is_pin_memory_available()
-        self.mc2_mask = torch.zeros(vllm_config.scheduler_config.max_batch_size, dtype=torch.bool, device=current_platform.device_type)
         self.decode_gear_list = self.vllm_config.npu_compilation_config.decode_gear_list
         if not self.use_spec_decode:
             self.max_batch_size = self.max_num_reqs
@@ -72,6 +75,9 @@ class MockRunner:
             self.max_batch_size = self.decode_gear_list[0]
 
         self.max_num_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        self.req_cnt = 0
+        self.req_prefix = 'chatcmpl-req-'
+        self.requests: dict[str, CachedRequestState] = {}
         self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
                                             dtype=torch.int64,
                                             device="cpu",
@@ -80,11 +86,15 @@ class MockRunner:
         self.input_ids = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int32,
                                      device=self.device)
+        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
+                                         dtype=torch.int64,
+                                         device="cpu",
+                                         pin_memory=is_pin_memory_available())
         self.positions = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int64,
                                      device=self.device)
         self.seq_lens = torch.zeros(self.max_num_reqs,
-                                    dtype=torch.int32,
+                                    dtype=torch.int64,
                                     device=self.device)
         self.slot_mapping = torch.zeros(self.max_num_tokens,
                                         dtype=torch.int64,
@@ -95,10 +105,15 @@ class MockRunner:
             (self.max_num_reqs * num_tokens_per_reqs_decode,
              (self.model_config.max_model_len + self.block_size - 1) // self.block_size),
             dtype=np.int32)
+        self.arange_np = np.arange(max(self.max_num_reqs + 1,
+                                       self.max_model_len,
+                                       self.max_num_tokens),
+                                   dtype=np.int64)
         self.positions_cpu = torch.zeros(self.max_num_tokens,
                                          dtype=torch.int64,
                                          device="cpu",
                                          pin_memory=self.pin_memory)
+        self.positions_np = self.positions_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
                                         dtype=torch.int32,
                                         device="cpu",
@@ -113,6 +128,12 @@ class MockRunner:
             vocab_size=self.model_config.hf_text_config.vocab_size,
             block_size=self.block_size,
         )
+        self.input_batch.token_ids_cpu_tensor = torch.zeros(
+            (self.max_num_reqs, self.model_config.max_model_len),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=False,
+        )
 
         self.enable_torchair_graph_mode = (
                     self.vllm_config.npu_compilation_config.level > CompilationLevel.NO_COMPILATION and supports_dynamo())
@@ -120,6 +141,11 @@ class MockRunner:
         logging.info(f"MockRunner: enable_torchair_graph_mode: {self.enable_torchair_graph_mode}")
 
         torch.cuda.get_device_properties = get_device_properties
+
+    def get_new_req_id(self):
+        req_id = self.req_prefix + str(self.req_cnt)
+        self.req_cnt += 1
+        return req_id
 
     def init_model(self, model_cls):
         device_config = self.vllm_config.device_config
@@ -265,6 +291,9 @@ class MockRunner:
                     inputs_embeds=inputs_embeds,
                 )
             return forward_results
+        fake_input = torch.zeros(self.max_batch_size, dtype=input_ids.dtype, device=input_ids.device)
+        fake_positions = torch.zeros(self.max_batch_size, dtype=input_ids.dtype, device=input_ids.device)
+        input_ids, positions = fake_input, fake_positions
         self.attn_state = AscendAttentionState.DecodeOnly
         attn_metadata = {}
         for kv_cache_group_id, kv_cache_group_spec in enumerate(self.kv_cache_group_specs):
@@ -293,6 +322,7 @@ class MockRunner:
                         self.dummy_model_mark_static = True
                 else:
                     logging.debug("Start running dummy eager model.")
+                logging.debug(f"Start running dummy {input_ids.shape=}, {positions.shape=}")
                 forward_results = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -300,5 +330,276 @@ class MockRunner:
                     inputs_embeds=inputs_embeds,
                     **model_kwargs
                 )
+
+        return forward_results
+
+    @torch.inference_mode()
+    def forward_prefill(self, prompt_token_ids, max_num_tokens):
+        num_token = len(prompt_token_ids)
+        print(f"forward_prefill {num_token=}")
+        req_id = self.get_new_req_id()
+        self.req_id = req_id
+        sampling_params = SamplingParams(
+            n=1,
+            temperature=0.0,
+            top_p=1.0,
+            ignore_eos=False,
+            max_tokens=1,
+            detokenize=False,
+        )
+        self.requests[req_id] = CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            mm_inputs=[],
+            mm_positions=[],
+            sampling_params=sampling_params,
+            generator=None,
+            block_ids=[[1]],
+            num_computed_tokens=0,
+            output_token_ids=[],
+            lora_request=None,
+        )
+        req_state = self.requests[req_id]
+        self.input_batch.add_request(req_state, None)
+
+        if self.vllm_config.kv_transfer_config is None:
+            self.vllm_config.kv_transfer_config = KVTransferConfig()
+        self.vllm_config.kv_transfer_config.kv_role = "kv_producer"
+        scheduler_output = Mock()
+        scheduler_output.total_num_scheduled_tokens = num_token
+        batch_reordered = self.attn_metadata_builders[0].reorder_batch(
+            self.input_batch, scheduler_output)
+        for i in range(1, len(self.kv_cache_group_specs)):
+            assert not self.attn_metadata_builders[i].reorder_batch(
+                self.input_batch, scheduler_output)
+
+        num_reqs = self.input_batch.num_reqs
+        self.input_batch.block_table.commit(num_reqs)
+        num_scheduled_tokens = np.array([
+            num_token
+        ], dtype=np.int32)
+        # Prepare positions
+        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        cu_num_tokens = np.cumsum(num_scheduled_tokens)
+        cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens, num_scheduled_tokens)
+        arange = self.arange_np[:num_token] - cumsums_offsets
+        positions_np = self.positions_np[:num_token]
+        np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
+
+        self.positions[:num_token].copy_(
+            self.positions_cpu[:num_token], non_blocking=True)
+        positions = self.positions[:num_token]
+
+        self.seq_lens_np[:num_reqs] = self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+
+        # Calculate the slot mapping for each KV cache group.
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(self.kv_cache_group_specs):
+            block_size = kv_cache_group_spec.kv_cache_spec.block_size
+            block_table: BlockTable = self.input_batch.block_table[kv_cache_group_id]
+            # NOTE(runze): since each request has at most M blocks, the offset is at most M-1
+            block_table_indices = (
+                req_indices * block_table.max_num_blocks_per_req +
+                np.minimum(positions_np // block_size, block_table.max_num_blocks_per_req - 1))
+            block_table_cpu = block_table.get_cpu_tensor()
+            block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+            block_offsets = positions_np % block_size
+            np.add(
+                block_numbers * block_size,
+                block_offsets,
+                out=block_table.slot_mapping_np[:num_token])
+
+        self.attn_state = AscendAttentionState.PrefillNoCache
+
+        graph_pad_size = 0
+        extra_builder_kwargs = {'graph_pad_size': 0}
+
+        # build attention metadata
+        attn_metadata = {}
+        self.full_attn_metadata = None
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(self.kv_cache_group_specs):
+            # Prepare for cascade attention if enabled & beneficial.
+            attn_metadata_i = self.attn_metadata_builders[kv_cache_group_id].build(
+                num_reqs=num_reqs,
+                num_actual_tokens=num_token,
+                max_query_len=num_token,
+                common_prefix_len=None,
+                **extra_builder_kwargs,
+            )
+            if kv_cache_group_id == 0:
+                self.full_attn_metadata = attn_metadata_i
+
+            if not isinstance(self.attn_metadata_builders[kv_cache_group_id], DummyAttentionMetadataBuilder):
+                raise ValueError(f"{self.attn_metadata_builders[kv_cache_group_id]} does not implement DummyAttentionMetadataBuilder")
+            for layer_name in kv_cache_group_spec.layer_names:
+                attn_metadata[layer_name] = attn_metadata_i
+
+        # Prepare input_ids
+        token_indices = (positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1])
+        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+                           0,
+                           torch.from_numpy(token_indices),
+                           out=self.input_ids_cpu[:num_token])
+
+        # Copy the tensors to the NPU.
+        self.input_ids[:num_token].copy_(
+            self.input_ids_cpu[:num_token], non_blocking=True)
+
+        sample_indices = cu_num_tokens - 1
+        sample_indices = torch.from_numpy(sample_indices).to(self.device, non_blocking=True)
+        spec_decode_metadata = None
+
+        input_ids = self.input_ids[:num_token]
+        model_kwargs = {}
+        model_kwargs["selected_indices"] = sample_indices
+
+        with set_forward_context(attn_metadata, self.vllm_config):
+            model_kwargs["kv_caches"] = self.kv_caches
+            model_kwargs["attn_metadata"] = attn_metadata
+            forward_results = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=None,
+                **model_kwargs,
+            )
+
+        return forward_results
+
+    @torch.inference_mode()
+    def forward_decode(self, num_token, max_num_tokens):
+        # reuse the req created in forward_prefill
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs > 0
+        print(f"forward_decode {num_token=}")
+
+        req_index = self.input_batch.req_id_to_index.get(self.req_id)
+        self.input_batch.num_computed_tokens_cpu[req_index] = (self.input_batch.num_prompt_tokens[req_index])
+        if self.vllm_config.kv_transfer_config is None:
+            self.vllm_config.kv_transfer_config = KVTransferConfig()
+        self.vllm_config.kv_transfer_config.kv_role = "kv_consumer"
+        scheduler_output = Mock()
+        scheduler_output.total_num_scheduled_tokens = num_token
+        scheduler_output.num_scheduled_tokens = {}
+        scheduler_output.num_scheduled_tokens[self.req_id] = num_token
+        scheduler_output.scheduled_spec_decode_tokens = {}
+        batch_reordered = self.attn_metadata_builders[0].reorder_batch(
+            self.input_batch, scheduler_output)
+        for i in range(1, len(self.kv_cache_group_specs)):
+            assert not self.attn_metadata_builders[i].reorder_batch(
+                self.input_batch, scheduler_output)
+
+        self.input_batch.block_table.commit(num_reqs)
+        num_scheduled_tokens = np.array([
+            num_token
+        ], dtype=np.int32)
+        # Prepare positions
+        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        cu_num_tokens = np.cumsum(num_scheduled_tokens)
+        cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens, num_scheduled_tokens)
+        arange = self.arange_np[:num_token] - cumsums_offsets
+        positions_np = self.positions_np[:num_token]
+        np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
+
+        self.positions[:num_token].copy_(
+            self.positions_cpu[:num_token], non_blocking=True)
+        positions = self.positions[:num_token]
+
+        self.seq_lens_np[:num_reqs] = self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+
+        # Calculate the slot mapping for each KV cache group.
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(self.kv_cache_group_specs):
+            block_size = kv_cache_group_spec.kv_cache_spec.block_size
+            block_table: BlockTable = self.input_batch.block_table[kv_cache_group_id]
+            # NOTE(runze): since each request has at most M blocks, the offset is at most M-1
+            block_table_indices = (
+                req_indices * block_table.max_num_blocks_per_req +
+                np.minimum(positions_np // block_size, block_table.max_num_blocks_per_req - 1))
+            block_table_cpu = block_table.get_cpu_tensor()
+            block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+            block_offsets = positions_np % block_size
+            np.add(
+                block_numbers * block_size,
+                block_offsets,
+                out=block_table.slot_mapping_np[:num_token])
+
+        self.attn_state = AscendAttentionState.DecodeOnly
+
+        graph_pad_size = 0
+        graph_pad_size = self.max_batch_size - num_token
+        print(f"forward_decode {self.max_batch_size=}, {graph_pad_size=}")
+        if graph_pad_size >= 0:
+            if self.uses_mrope:
+                padding_positions = torch.zeros(positions.size(0), graph_pad_size, dtype=positions.dtype, device=positions.device)
+                positions = torch.cat([positions, padding_positions], dim=1)
+            else:
+                padding_positions = torch.zeros(graph_pad_size, dtype=positions.dtype, device=positions.device)
+                positions = torch.cat([positions, padding_positions])
+        extra_builder_kwargs = {'graph_pad_size': graph_pad_size}
+
+        # build attention metadata
+        attn_metadata = {}
+        self.full_attn_metadata = None
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(self.kv_cache_group_specs):
+            # Prepare for cascade attention if enabled & beneficial.
+            attn_metadata_i = self.attn_metadata_builders[kv_cache_group_id].build(
+                num_reqs=num_reqs,
+                num_actual_tokens=num_token,
+                max_query_len=num_token,
+                common_prefix_len=None,
+                **extra_builder_kwargs,
+            )
+            if kv_cache_group_id == 0:
+                self.full_attn_metadata = attn_metadata_i
+
+            if not isinstance(self.attn_metadata_builders[kv_cache_group_id], DummyAttentionMetadataBuilder):
+                raise ValueError(f"{self.attn_metadata_builders[kv_cache_group_id]} does not implement DummyAttentionMetadataBuilder")
+            if self.enable_torchair_graph_mode and self.attn_state == AscendAttentionState.DecodeOnly:
+                self.attn_metadata_builders[kv_cache_group_id].mark_static_for_attn_metadata(attn_metadata_i)
+            for layer_name in kv_cache_group_spec.layer_names:
+                attn_metadata[layer_name] = attn_metadata_i
+
+        # Prepare input_ids
+        token_indices = (positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1])
+        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+                           0,
+                           torch.from_numpy(token_indices),
+                           out=self.input_ids_cpu[:num_token])
+
+        # Copy the tensors to the NPU.
+        self.input_ids[:num_token].copy_(
+            self.input_ids_cpu[:num_token], non_blocking=True)
+
+        sample_indices = cu_num_tokens - 1
+        sample_indices = torch.from_numpy(sample_indices).to(self.device, non_blocking=True)
+        spec_decode_metadata = None
+
+        input_ids = self.input_ids[:num_token]
+        if graph_pad_size >= 0:
+            if self.attn_state == AscendAttentionState.DecodeOnly:
+                padding = torch.zeros(graph_pad_size, dtype=input_ids.dtype, device=input_ids.device)
+            else:
+                vocab_size = self.model_config.get_vocab_size()
+                padding = torch.randint(1, vocab_size, (graph_pad_size,), dtype=input_ids.dtype, device=input_ids.device)
+            input_ids = torch.cat([input_ids, padding])
+        inputs_embeds = None
+        model_kwargs = {}
+        model_kwargs["selected_indices"] = None
+
+        with set_forward_context(attn_metadata, self.vllm_config):
+            if not self.model_mark_static:
+                if isinstance(self.model, GraphCompileConfiguration):
+                    self.model.mark_static_for_graph(input_ids, positions, attn_metadata, self.kv_caches)
+                else:
+                    mark_static_for_graph_default(input_ids, inputs_embeds, positions, self.kv_caches)
+                self.model_mark_static = True
+            model_kwargs["kv_caches"] = self.kv_caches
+            model_kwargs["attn_metadata"] = attn_metadata
+            forward_results = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=None,
+                inputs_embeds=None,
+                **model_kwargs,
+            )
 
         return forward_results

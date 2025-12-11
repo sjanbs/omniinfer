@@ -59,4 +59,5 @@ def creat_vllm_config(base_config):
     vllm_config.scheduler_config = scheduler_config
     vllm_config.device_config = device_config
     vllm_config.speculative_config = None
+    vllm_config.kv_transfer_config = None
     return vllm_config
