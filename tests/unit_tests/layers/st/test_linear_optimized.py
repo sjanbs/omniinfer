@@ -14,6 +14,13 @@ from omni.layers.linear import (
     AscendRowParallelLinear,
     DP2TPRowParallelLinear,
     RowParallelLinear,
+    RowParallelLinearCross,
+    RowParallelLinearWithReduceScatter,
+    RowParallelFlashCommLinear,
+    ColumnParallelFlashCommLinear,
+    QKVParallelFlashCommLinear,
+    MergedColumnParallelFlashCommLinear,
+    MergedReplicatedLinear,
     Tp2DpAndTpRowParallelLinear,
 )
 from omni.models.config_loader.loader import model_extra_config
@@ -290,6 +297,336 @@ def _logic_tp2dp_and_tp_row_parallel_linear_par_no_reduce(local_rank, world_size
     assert torch.allclose(out, expected_partial, atol=atol, rtol=rtol)
     assert torch.allclose(out_bias, layer.bias, atol=atol, rtol=rtol)
 
+def _logic_row_parallel_reduce_scatter(local_rank, world_size, dtype,
+                                       input_size, output_size, batch_size):
+    from omni.layers.linear import RowParallelLinearWithReduceScatter
+    from omni.adaptors.vllm.distributed.communication_op import (
+        mla_tensor_model_parallel_reduce_scatter,
+    )
+
+    device = torch.device("npu")
+    golden = torch.nn.Linear(input_size, output_size, bias=False).to(dtype).to(device)
+
+    layer = RowParallelLinearWithReduceScatter(
+        input_size=input_size,
+        output_size=output_size,
+        bias=False,
+        input_is_parallel=False,
+        skip_bias_add=False,
+        params_dtype=dtype,
+        reduce_results=True,
+        quant_config=None,
+        prefix="test_row_rs",
+    ).to(device)
+
+    part_size = input_size // world_size
+    start = local_rank * part_size
+    end = start + part_size
+    with torch.no_grad():
+        layer.weight.data.copy_(golden.weight.data[:, start:end])
+
+    input_tensor = torch.randn(batch_size, input_size, dtype=dtype, device=device)
+    out, out_bias = layer(input_tensor)
+
+    partial_outputs = []
+    for rank in range(world_size):
+        start_r = rank * part_size
+        end_r = start_r + part_size
+        shard_input = input_tensor[..., start_r:end_r]
+        shard_weight = golden.weight.data[:, start_r:end_r]
+        partial_outputs.append(torch.matmul(shard_input, shard_weight.T))
+
+    chunked = [torch.tensor_split(partial, world_size, dim=0) for partial in partial_outputs]
+    expected_local = sum(chunks[local_rank] for chunks in chunked)
+    atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (1e-3, 1e-3)
+    assert out.shape == expected_local.shape
+    assert torch.allclose(out, expected_local, atol=atol, rtol=rtol)
+    assert out_bias is None
+
+def _logic_merged_replicated_linear(local_rank, world_size, dtype):
+    from omni.layers.linear import MergedReplicatedLinear
+
+    device = torch.device("npu")
+    input_size = 6
+    output_sizes = [4, 6]
+    batch_size = 3
+
+    layer = MergedReplicatedLinear(
+        input_size=input_size,
+        output_sizes=output_sizes,
+        bias=True,
+        skip_bias_add=False,
+        params_dtype=dtype,
+        quant_config=None,
+        prefix="test_merged_rep",
+    ).to(device)
+
+    full_weight = torch.randn(sum(output_sizes), input_size, dtype=dtype, device=device)
+    layer.weight_loader(layer.weight, full_weight.clone())
+    with torch.no_grad():
+        layer.bias.copy_(torch.randn(sum(output_sizes), dtype=dtype, device=device))
+
+    input_tensor = torch.randn(batch_size, input_size, dtype=dtype, device=device)
+    out, out_bias = layer(input_tensor)
+
+    expected = torch.matmul(input_tensor, full_weight.T) + layer.bias
+    atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (1e-3, 1e-3)
+    assert torch.allclose(out, expected, atol=atol, rtol=rtol)
+    assert out_bias is None
+
+def _logic_row_parallel_linear_cross(local_rank, world_size, dtype):
+    from omni.layers.linear import RowParallelLinearCross
+
+    device = torch.device("npu")
+    input_size = 8
+    output_size = 5
+    batch_size = 3
+
+    layer = RowParallelLinearCross(
+        input_size=input_size,
+        output_size=output_size,
+        bias=True,
+        tp_size=world_size,
+        tp_rank=local_rank,
+        input_is_parallel=False,
+        skip_bias_add=True,
+        params_dtype=dtype,
+        reduce_results=False,
+        quant_config=None,
+        prefix="test_row_cross",
+    ).to(device)
+
+    golden_weight = torch.randn(output_size, input_size, dtype=dtype, device=device)
+    golden_bias = torch.randn(output_size, dtype=dtype, device=device)
+    part_size = input_size // world_size
+    start = local_rank * part_size
+    end = start + part_size
+    with torch.no_grad():
+        layer.weight.data.copy_(golden_weight[:, start:end])
+        layer.bias.data.copy_(golden_bias)
+
+    input_tensor = torch.randn(batch_size, input_size, dtype=dtype, device=device)
+    out, out_bias = layer(input_tensor)
+
+    expected_partial = torch.matmul(input_tensor[..., start:end], golden_weight[:, start:end].T)
+    atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (1e-3, 1e-3)
+    assert torch.allclose(out, expected_partial, atol=atol, rtol=rtol)
+    assert torch.allclose(out_bias, golden_bias, atol=atol, rtol=rtol)
+
+def _logic_row_parallel_flash_comm_linear(local_rank, world_size, dtype):
+    from omni.layers.linear import RowParallelFlashCommLinear
+    from vllm.distributed import tensor_model_parallel_reduce_scatter
+
+    device = torch.device("npu")
+    input_size = 8
+    output_size = 6
+    batch_size = 3
+
+    full_weight = torch.randn(output_size, input_size, dtype=dtype, device=device)
+    part_size = input_size // world_size
+    start = local_rank * part_size
+    end = start + part_size
+    shard_weight = full_weight[:, start:end].contiguous()
+
+    full_input = torch.randn(batch_size, input_size, dtype=dtype, device=device)
+    shard_input = full_input[..., start:end].contiguous()
+
+    partial_outputs = []
+    for rank in range(world_size):
+        start_r = rank * part_size
+        end_r = start_r + part_size
+        shard_in_r = full_input[..., start_r:end_r]
+        shard_w_r = full_weight[:, start_r:end_r]
+        partial_outputs.append(torch.matmul(shard_in_r, shard_w_r.T))
+
+    layer_ar = RowParallelFlashCommLinear(
+        input_size=input_size,
+        output_size=output_size,
+        tp_size=world_size,
+        tp_rank=local_rank,
+        bias=False,
+        skip_bias_add=False,
+        params_dtype=dtype,
+        quant_config=None,
+        prefix="test_row_flash_ar",
+    ).to(device)
+    layer_ar.weight_loader(layer_ar.weight, full_weight.clone())
+    layer_ar.quant_method.process_weights_after_loading(layer_ar)
+
+    expected_partial = torch.matmul(shard_input, shard_weight.T)
+    out_ar, out_bias_ar = layer_ar(shard_input, reduce_type="none")
+    atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (1e-3, 1e-3)
+    assert torch.allclose(out_ar, expected_partial, atol=atol, rtol=rtol)
+    assert out_bias_ar is None
+
+    layer_rs = RowParallelFlashCommLinear(
+        input_size=input_size,
+        output_size=output_size,
+        tp_size=world_size,
+        tp_rank=local_rank,
+        bias=False,
+        skip_bias_add=False,
+        params_dtype=dtype,
+        quant_config=None,
+        prefix="test_row_flash_rs",
+    ).to(device)
+    layer_rs.weight_loader(layer_rs.weight, full_weight.clone())
+    layer_rs.quant_method.process_weights_after_loading(layer_rs)
+
+    out_rs, out_bias_rs = layer_rs(shard_input, reduce_type="none")
+    assert torch.allclose(out_rs, expected_partial, atol=atol, rtol=rtol)
+    assert out_bias_rs is None
+
+def _logic_column_parallel_flash_comm_linear(local_rank, world_size, dtype):
+    from omni.layers.linear import ColumnParallelFlashCommLinear
+
+    device = torch.device("npu")
+    input_size = 8
+    output_size = 10
+    batch_size = 2
+
+    layer = ColumnParallelFlashCommLinear(
+        input_size=input_size,
+        output_size=output_size,
+        tp_size=world_size,
+        tp_rank=local_rank,
+        bias=True,
+        skip_bias_add=True,
+        params_dtype=dtype,
+        quant_config=None,
+        prefix="test_col_flash",
+    ).to(device)
+
+    full_weight = torch.randn(output_size, input_size, dtype=dtype, device=device)
+    full_bias = torch.randn(output_size, dtype=dtype, device=device)
+    shard_size = output_size // world_size
+    start = local_rank * shard_size
+    end = start + shard_size
+    layer.weight_loader(layer.weight, full_weight.clone())
+    layer.quant_method.process_weights_after_loading(layer)
+    with torch.no_grad():
+        layer.bias.data.copy_(full_bias[start:end])
+
+    input_tensor = torch.randn(batch_size, input_size, dtype=dtype, device=device)
+    out, out_bias = layer(input_tensor)
+
+    expected = torch.matmul(input_tensor, full_weight[start:end].T)
+    atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (1e-3, 1e-3)
+    assert torch.allclose(out, expected, atol=atol, rtol=rtol)
+    assert torch.allclose(out_bias, full_bias[start:end], atol=atol, rtol=rtol)
+
+def _logic_qkv_parallel_flash_comm_linear(local_rank, world_size, dtype):
+    from omni.layers.linear import QKVParallelFlashCommLinear
+
+    device = torch.device("npu")
+    hidden_size = 8
+    head_size = 2
+    total_num_heads = 4
+    total_num_kv_heads = 2
+    batch_size = 2
+
+    layer = QKVParallelFlashCommLinear(
+        hidden_size=hidden_size,
+        head_size=head_size,
+        total_num_heads=total_num_heads,
+        total_num_kv_heads=total_num_kv_heads,
+        tp_size=world_size,
+        tp_rank=local_rank,
+        bias=True,
+        skip_bias_add=False,
+        params_dtype=dtype,
+        quant_config=None,
+        prefix="test_qkv_flash",
+    ).to(device)
+
+    output_size = layer.output_size
+    full_weight = torch.randn(output_size, hidden_size, dtype=dtype, device=device)
+    full_bias = torch.randn(output_size, dtype=dtype, device=device)
+    layer.weight_loader(layer.weight, full_weight.clone())
+    layer.quant_method.process_weights_after_loading(layer)
+
+    num_heads = layer.num_heads
+    num_kv_heads = layer.num_kv_heads
+    q_rows = num_heads * head_size
+    kv_rows = num_kv_heads * head_size
+    q_slice = slice(local_rank * q_rows, (local_rank + 1) * q_rows)
+    k_start = total_num_heads * head_size + local_rank * kv_rows
+    k_slice = slice(k_start, k_start + kv_rows)
+    v_start = (total_num_heads + total_num_kv_heads) * head_size + local_rank * kv_rows
+    v_slice = slice(v_start, v_start + kv_rows)
+
+    weight_shard = torch.cat([
+        full_weight[q_slice],
+        full_weight[k_slice],
+        full_weight[v_slice],
+    ], dim=0)
+    bias_shard = torch.cat([
+        full_bias[q_slice],
+        full_bias[k_slice],
+        full_bias[v_slice],
+    ], dim=0)
+    with torch.no_grad():
+        layer.bias.data.copy_(bias_shard)
+
+    input_tensor = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
+    out, out_bias = layer(input_tensor)
+
+    expected = torch.matmul(input_tensor, weight_shard.T) + bias_shard
+    atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (1e-3, 1e-3)
+    assert torch.allclose(out, expected, atol=atol, rtol=rtol)
+    assert out_bias is None
+
+def _logic_merged_column_parallel_flash_comm_linear(local_rank, world_size, dtype):
+    from omni.layers.linear import MergedColumnParallelFlashCommLinear
+
+    device = torch.device("npu")
+    input_size = 6
+    output_sizes = [6, 8]
+    batch_size = 2
+
+    layer = MergedColumnParallelFlashCommLinear(
+        input_size=input_size,
+        output_sizes=output_sizes,
+        tp_size=world_size,
+        tp_rank=local_rank,
+        bias=True,
+        skip_bias_add=False,
+        params_dtype=dtype,
+        quant_config=None,
+        prefix="test_merged_col_flash",
+    ).to(device)
+
+    weights = [
+        torch.randn(output_sizes[0], input_size, dtype=dtype, device=device),
+        torch.randn(output_sizes[1], input_size, dtype=dtype, device=device),
+    ]
+    biases = [
+        torch.randn(output_sizes[0], dtype=dtype, device=device),
+        torch.randn(output_sizes[1], dtype=dtype, device=device),
+    ]
+    layer.weight_loader(layer.weight, weights[0].clone(), loaded_shard_id=0)
+    layer.weight_loader(layer.weight, weights[1].clone(), loaded_shard_id=1)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    shard_sizes = [size // world_size for size in output_sizes]
+    shard0 = weights[0][local_rank * shard_sizes[0]:(local_rank + 1) * shard_sizes[0]]
+    shard1 = weights[1][local_rank * shard_sizes[1]:(local_rank + 1) * shard_sizes[1]]
+    weight_shard = torch.cat([shard0, shard1], dim=0)
+    bias_shard = torch.cat([
+        biases[0][local_rank * shard_sizes[0]:(local_rank + 1) * shard_sizes[0]],
+        biases[1][local_rank * shard_sizes[1]:(local_rank + 1) * shard_sizes[1]],
+    ], dim=0)
+    with torch.no_grad():
+        layer.bias.data.copy_(bias_shard)
+
+    input_tensor = torch.randn(batch_size, input_size, dtype=dtype, device=device)
+    out, out_bias = layer(input_tensor)
+
+    expected = torch.matmul(input_tensor, weight_shard.T) + bias_shard
+    atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (1e-3, 1e-3)
+    assert torch.allclose(out, expected, atol=atol, rtol=rtol)
+    assert out_bias is None
+
 class AscendMMRSModel(torch.nn.Module):
     def __init__(self, hidden_size=16, dtype=torch.bfloat16, device=None):
         super().__init__()
@@ -453,4 +790,56 @@ def test_tp2dp_and_tp_row_parallel_linear_par_no_reduce(distributed_worker_pool,
     distributed_worker_pool(
         _logic_tp2dp_and_tp_row_parallel_linear_par_no_reduce,
         dtype, batch_size, input_size, output_size
+    )
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_row_parallel_linear_with_reduce_scatter(distributed_worker_pool, dtype):
+    input_size = 8
+    output_size = 6
+    batch_size = 4
+    distributed_worker_pool(
+        _logic_row_parallel_reduce_scatter,
+        dtype, input_size, output_size, batch_size
+    )
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_merged_replicated_linear(distributed_worker_pool, dtype):
+    distributed_worker_pool(
+        _logic_merged_replicated_linear,
+        dtype
+    )
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_row_parallel_linear_cross(distributed_worker_pool, dtype):
+    distributed_worker_pool(
+        _logic_row_parallel_linear_cross,
+        dtype
+    )
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_row_parallel_flash_comm_linear(distributed_worker_pool, dtype):
+    distributed_worker_pool(
+        _logic_row_parallel_flash_comm_linear,
+        dtype
+    )
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_column_parallel_flash_comm_linear(distributed_worker_pool, dtype):
+    distributed_worker_pool(
+        _logic_column_parallel_flash_comm_linear,
+        dtype
+    )
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_qkv_parallel_flash_comm_linear(distributed_worker_pool, dtype):
+    distributed_worker_pool(
+        _logic_qkv_parallel_flash_comm_linear,
+        dtype
+    )
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_merged_column_parallel_flash_comm_linear(distributed_worker_pool, dtype):
+    distributed_worker_pool(
+        _logic_merged_column_parallel_flash_comm_linear,
+        dtype
     )
