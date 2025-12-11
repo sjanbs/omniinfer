@@ -18,6 +18,11 @@ PROXY_PORT=7000
 
 @pytest.fixture(scope="module")
 def setup_teardown():
+    if os.getenv("SKIP_FIXTURE") == "1":
+        print("\n[DEBUG] Skipping setup/teardown")
+        yield
+        return
+
     setup_proxy(PROXY_PORT, PREFILL_NUM, PREFILL_BASE_API_PORT, DECODE_NUM, DECODE_BASE_API_PORT)
     processes = strart_vllm_mock(PREFILL_NUM, PREFILL_BASE_API_PORT, DECODE_NUM, DECODE_BASE_API_PORT)
     if not processes:
