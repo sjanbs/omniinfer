@@ -2,225 +2,285 @@ import random
 import torch
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
-from vllm.config import QuantizationConfig
-from vllm.platforms import current_platform
-from vllm.distributed.parallel_state import GroupCoordinator as GroupCoordinatorGPU
+from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.attention import Attention
+from vllm.attention.backends.abstract import (
+    AttentionMetadata,
+)
 from omni.models.config_loader.loader import model_extra_config
-from omni.layers.moe.deepseek_moe import ReplicatedDeepseekMLP, ParallelDeepseekMLP
-from omni.adaptors.vllm.distributed.parallel_state import GroupCoordinator
+from omni.layers.attention.deepseek_mla import DeepseekMLA
 
 
-class test_ReplicatedDeepseekMLP(TestCase):
-    @patch('vllm.platforms.current_platform')
-    @patch('vllm.distributed.parallel_state._WORLD',
-    new_callable=lambda: MagicMock(spec=GroupCoordinatorGPU))
-    @patch('vllm.distributed.parallel_state._PP',
-    new_callable=lambda: MagicMock(spec=GroupCoordinatorGPU))
-    @patch('vllm.distributed.parallel_state._EP',
-    new_callable=lambda: MagicMock(spec=GroupCoordinatorGPU))
+class Test_DeepseekV32_MLA(TestCase):
+    @patch("vllm.distributed.get_tensor_model_parallel_world_size",
+    return_value=8)
+    @patch('vllm.distributed.parallel_state._DP',
+    new_callable=lambda: MagicMock(spec=GroupCoordinator))
+    @patch('vllm.distributed.parallel_state._TP',
+    new_callable=lambda: MagicMock(spec=GroupCoordinator))
+    @patch('transformers.PretrainedConfig')
     @patch('vllm.config.QuantizationConfig',
-    new_callable=lambda: MagicMock(spec=QuantizationConfig))    
+    new_callable=lambda: MagicMock(spec=QuantizationConfig))
+    @patch('vllm.config.CacheConfig',
+    new_callable=lambda: MagicMock(spec=CacheConfig))
     @patch('omni.models.config_loader.loader.model_extra_config',
     new_callable=lambda: MagicMock(spec=model_extra_config))
-    def setUp(self,
+    def setUp(self, 
               mock_model_extra_config,
+              mock_cache_config,
               mock_quant_config,
-              mock_vllm_ep,
-              mock_vllm_pp,
-              mock_vllm_world,
-              mock_current_platform):
-        self.mock_hidden_size = 7168
-        self.mock_intermediate_size = 2048
-        self.mock_hidden_act = "silu"
-        self.mock_reduce_results = False
-        self.mock_prefix = "model.layers.3.mlp.shared_experts"
-        self.mock_ep_size = 8
-        self.mock_world_size = 8
-        self.mock_rank_in_group = 0
-        self.mock_bsz = 256
+              mock_pretrain_config,
+              mock_vllm_tp,
+              mock_vllm_dp,
+              mock_vllm_tp_world_size
+              ):
 
-        mock_model_extra_config.operator_opt_config.decode_moe_dispatch_combine = True
+        # mock parameters
+        self.hidden_size = 7168
+        self.num_heads = 128
+        self.qk_nope_head_dim = 128
+        self.qk_rope_head_dim = 64
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.scale = self.qk_head_dim ** -0.5
+        
+        self.v_head_dim = 64
+        self.q_lora_rank = 1536
+        self.kv_lora_rank = 512
+        self.rope_theta = 10000
+        self.rope_scaling = {'beta_fast': 32, 
+                        'beta_slow': 1, 
+                        'factor': 40, 
+                        'mscale': 1.0, 
+                        'mscale_all_dim': 1.0, 
+                        'original_max_position_embeddings': 4096,  
+                        'type': 'yarn', 
+                        'rope_type': 
+                        'deepseek_yarn'}
+        self.max_position_embeddings = 8192
+        self.prefix = "model.layers.5.self_attn"
+
+        # mock model extra configs for initialization
+        mock_model_extra_config.operator_opt_config.enable_dsa = True
+        mock_model_extra_config.operator_opt_config.merge_qkv = False
+        mock_model_extra_config.operator_opt_config.use_mlaprolog = True
+        mock_model_extra_config.operator_opt_config.moe_multi_stream_tune = False
+        mock_model_extra_config.operator_opt_config.use_omni_cache = False
+        mock_model_extra_config.parall_config.o_proj_tp_size = 8
+
+        # mock vllm configs for initialization
+        mock_pretrain_config.rms_norm_eps.return_value = 1e-6
+        mock_pretrain_config.hidden_size = self.hidden_size
+        mock_pretrain_config.qk_rope_head_dim = self.qk_rope_head_dim
+        mock_pretrain_config.q_lora_rank = self.q_lora_rank
+
         mock_quant_config = None
-        mock_current_platform.device_type = "npu"
 
-        mock_vllm_ep.world_size = self.mock_ep_size
-        mock_vllm_ep.rank_in_group = MagicMock()
-        mock_vllm_ep.device_group = MagicMock()  
-        mock_vllm_pp.world_size = self.mock_world_size
-        mock_vllm_pp.rank_in_group = self.mock_rank_in_group
-        mock_vllm_pp.device_group = MagicMock()  
-        mock_vllm_world.world_size = self.mock_world_size
-        mock_vllm_world.rank_in_group = self.mock_rank_in_group
-        mock_vllm_world.device_group = MagicMock()  
+        # mock communication configs for initialization
+        mock_vllm_tp.world_size = 8
+        mock_vllm_tp.rank_in_group = MagicMock()
+        mock_vllm_tp.device_group = MagicMock()  
+        mock_vllm_dp.world_size = 1
+        mock_vllm_dp.rank_in_group = MagicMock()
+        mock_vllm_dp.device_group = MagicMock() 
 
         import vllm.distributed.parallel_state as vllm_ps
-        vllm_ps._TP = mock_vllm_ep
-        vllm_ps._PP = mock_vllm_pp
-        vllm_ps._WORLD = mock_vllm_world
+        vllm_ps._TP = mock_vllm_tp
+        vllm_ps._DP = mock_vllm_dp
 
-        self.mlp = ReplicatedDeepseekMLP(hidden_size=self.mock_hidden_size,
-                                         intermediate_size=self.mock_intermediate_size,
-                                         hidden_act=self.mock_hidden_act,
-                                         quant_config=mock_quant_config,
-                                         reduce_results=self.mock_reduce_results,
-                                         prefix=self.mock_prefix)   
-    
+        self.mla = DeepseekMLA(
+                config=mock_pretrain_config,
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                rope_theta=self.rope_theta,
+                rope_scaling=self.rope_scaling,
+                max_position_embeddings=self.max_position_embeddings,
+                cache_config=mock_cache_config,
+                quant_config=mock_quant_config,
+                prefix=f"{self.prefix}.self_attn",
+            )
+
+    def test_init(self):
+        self.assertEqual(self.mla.hidden_size, self.hidden_size)
+        self.assertEqual(self.mla.qk_nope_head_dim, self.qk_nope_head_dim)
+        self.assertEqual(self.mla.qk_rope_head_dim, self.qk_rope_head_dim)
+        self.assertEqual(self.mla.qk_head_dim, self.qk_head_dim)
+        self.assertEqual(self.mla.v_head_dim, self.v_head_dim)
+        self.assertEqual(self.mla.q_lora_rank, self.q_lora_rank)
+        self.assertEqual(self.mla.kv_lora_rank, self.kv_lora_rank)
+        self.assertEqual(self.mla.num_heads, self.num_heads)
+        self.assertEqual(self.mla.rope_theta, self.rope_theta)
+
+        self.assertIsNotNone(self.mla.o_proj)
+        self.assertIsNotNone(self.mla.q_a_proj)
+        self.assertIsNotNone(self.mla.q_b_proj)
+        self.assertIsNotNone(self.mla.kv_b_proj)
+        self.assertIsNotNone(self.mla.q_a_layernorm)
+        self.assertIsNotNone(self.mla.kv_a_layernorm)
+        self.assertIsNotNone(self.mla.kv_a_proj_with_mqa)
+        self.assertIsNotNone(self.mla.q_norm_event)
+        self.assertIsNotNone(self.mla.kv_a_proj_event)
+        self.assertIsNotNone(self.mla.kv_all_gather_event)
+        self.assertIsNotNone(self.mla.rotary_emb)
+        self.assertIsNotNone(self.mla.attn_mask)
+        self.assertIsNotNone(self.mla.vllm_attn)
+
+        self.assertEqual(self.mla.is_init, True)
+        self.assertEqual(self.mla.layer_idx, 5)
+
     def tearDown(self):   
         import vllm.distributed.parallel_state as vllm_ps
         vllm_ps._TP = None
-        vllm_ps._PP = None
-        vllm_ps._WORLD = None   
+        vllm_ps._DP = None  
 
-    def test_initialization(self):
-        self.assertIsNotNone(self.mlp.gate_up_proj)      
-        self.assertIsNotNone(self.mlp.down_proj)     
-        self.assertIsNotNone(self.mlp.act_fn_obj)      
+    @patch("omni.layers.attention.deepseek_mla.mla_tensor_model_parallel_all_gather")
+    @patch("torch_npu.npu_interleave_rope")
+    @patch("vllm.attention.backends.abstract.AttentionMetadata")
+    def test_forward_prefill_absorb_wo_kvcache(self, 
+                                               mock_attn_meta_data,
+                                               mock_npu_interleave_rope,
+                                               mock_tp_all_gather
+                                               ):
+        # mock layers
+        mock_bsz = 256
+        mock_kv_cache = None
+        mock_positions = torch.randint(low=0, high=1024, size=(2048,), dtype=torch.int64)
+        mock_hidden_states = torch.randn(mock_bsz, self.hidden_size, dtype=torch.bfloat16)
+        self.mla.W_UK = torch.randn(16, 128, self.kv_lora_rank, dtype=torch.bfloat16)
 
-        self.assertTrue(hasattr(self.mlp, 'ep_size'))
-        self.assertTrue(hasattr(self.mlp, 'global_rank'))
-        self.assertTrue(hasattr(self.mlp, 'world_size'))
-        self.assertTrue(hasattr(self.mlp, 'moe_all_to_all_group'))
-        self.assertTrue(hasattr(self.mlp, 'moe_all_to_all_group_name'))
-        self.assertTrue(hasattr(self.mlp, 'moe_rs_group'))
-        self.assertTrue(hasattr(self.mlp, 'moe_rs_group_rank'))
-        self.assertTrue(hasattr(self.mlp, 'moe_rs_group_name'))
+        mock_attn_meta_data.prefill.cos.return_value = torch.randn(2048, 1, 1, 64, dtype=torch.bfloat16)
+        mock_attn_meta_data.prefill.sin.return_value = torch.randn(2048, 1, 1, 64, dtype=torch.bfloat16)
 
-        self.assertEqual(self.mlp.tp_size, 1)
-        self.assertEqual(self.mlp.ep_size, self.mock_ep_size)
-        self.assertEqual(self.mlp.global_rank, self.mock_rank_in_group)
-        self.assertEqual(self.mlp.world_size, self.mock_world_size)
+        q_lora = torch.randn(mock_bsz, self.q_lora_rank, dtype=torch.float)   
+        self.mla.q_a_proj.forward = MagicMock(return_value=[q_lora])
 
-    def test_act_fn(self):
-        mock_input = [torch.randint(low=0, high=self.mock_bsz, size=(self.mock_bsz, 4096), dtype=torch.int32),
-                      torch.randn(self.mock_bsz, dtype=torch.float32)]
-        mock_quant_symbol = True
-
-        self.mlp.gate_up_proj.weight_scale = MagicMock(return_value=torch.randn(4096, dtype=torch.float32))
-        self.mlp.act_fn_obj.forward = MagicMock(return_value={"x_int8": torch.randint(low=0, high=128, size=(self.mock_bsz, 2048), dtype=torch.int8),
-                                                                "pertoken_scale":torch.randn(self.mock_bsz, dtype=torch.float32)})
-
-        result = self.mlp.act_fn(x=mock_input, quant_symbol=mock_quant_symbol)
-
-        self.assertIsInstance(result, dict)
-        self.assertIn('x_int8', result)
-        self.assertIn('pertoken_scale', result)
-        self.assertIsInstance(result['x_int8'], torch.Tensor)
-        self.assertIsInstance(result['pertoken_scale'], torch.Tensor)
-
-    def test_forward(self):
-        mock_input = torch.randn(self.mock_bsz, self.mock_hidden_size, dtype=torch.bfloat16)
-        self.mlp.quant_symbol = True
+        latent_cache = torch.randn(mock_bsz, 576, dtype=torch.bfloat16)
+        self.mla.kv_a_proj_with_mqa.forward =  MagicMock(return_value=[latent_cache, None])
         
-        self.mlp.gate_up_proj.forward = MagicMock(return_value=[torch.randint(low=0, high=self.mock_bsz, size=(self.mock_bsz, 4096), dtype=torch.int32),
-                                                    torch.randn(self.mock_bsz, dtype=torch.float32)])
-        self.mlp.act_fn = MagicMock(return_value={"x_int8": torch.randint(low=0, high=128, size=(self.mock_bsz, 2048), dtype=torch.int8),
-                                                          "pertoken_scale":torch.randn(self.mock_bsz, dtype=torch.float32)})
-        self.mlp.down_proj.forward = MagicMock(return_value=[torch.randn(self.mock_bsz, self.mock_hidden_size, dtype=torch.bfloat16), None])
+        mock_tp_all_gather.side_effect = lambda data, dim, comm_group: data
+        
+        self.mla.q_a_layernorm.forward = MagicMock(side_effect=lambda data: data)
 
-        result = self.mlp.forward(x=mock_input)
+        self.mla.q_b_proj.forward = MagicMock(return_value=torch.randn(mock_bsz, 128, 192, dtype=torch.bfloat16))
 
-        self.assertIsInstance(result, torch.Tensor)
-        self.assertEqual(result.shape[0], self.mock_bsz)
-        self.assertEqual(result.shape[1], self.mock_hidden_size)
+        self.mla.kv_a_layernorm.forward = MagicMock(side_effect=lambda data: data)
 
+        mock_npu_interleave_rope.side_effect = lambda data, cos, sin: data
 
-class test_ParallelDeepseekMLP(TestCase):
-  
-    @patch('omni.adaptors.vllm.distributed.parallel_state._MLP_TP',
-    new_callable=lambda: MagicMock(spec=GroupCoordinator))    
-    @patch('vllm.config.QuantizationConfig',
-    new_callable=lambda: MagicMock(spec=QuantizationConfig))
-    def setUp(self, mock_quant_config, mock_omni_mlp_tp):
-        self.mock_hidden_size = 7168
-        self.mock_intermediate_size = 18432
-        self.mock_hidden_act = "silu"
-        self.mock_reduce_results = True
-        self.mock_prefix = "model.layers.0.mlp"
-        self.mock_bsz = 8
-        self.mock_world_size = 8
-        self.mock_rank_in_group = 0
+        self.mla._apply_attention = MagicMock()
+        self.mla._apply_attention.side_effect = lambda idc, q_n, q_r, k_r, attn, is_second_attn: q_n
 
-        mock_quant_config = None
+        self.mla.mla_epilog = MagicMock()
+        self.mla.mla_epilog.return_value = torch.randn(mock_bsz, self.hidden_size, dtype=torch.bfloat16)
 
-        mock_omni_mlp_tp.world_size = self.mock_world_size
-        mock_omni_mlp_tp.rank_in_group = 0
-        mock_omni_mlp_tp.device_group = MagicMock()  
+        self.mla.indexer = MagicMock()
+        self.mla.indexer.return_value = [torch.randint(low=0, high=8, size=(8, 1, 2048), dtype=torch.int32),
+                                         torch.randint(low=0, high=8, size=(8, 1, 2048), dtype=torch.int32),
+                                         torch.randn(8, 1, 128, dtype=torch.bfloat16)]
+                                         
+        result = self.mla._forward_prefill_absorb(positions=mock_positions,
+                                                  hidden_states=mock_hidden_states,
+                                                  kv_cache=mock_kv_cache,
+                                                  attn_metadata=mock_attn_meta_data,
+                                                  comm_group=None
+                                                )
 
-        import omni.adaptors.vllm.distributed.parallel_state as omni_ps
-        omni_ps._MLP_TP = mock_omni_mlp_tp
+        self.assertEqual(result.shape[0], mock_bsz)
+        self.assertEqual(result.shape[1], self.hidden_size)
+        self.assertEqual(mock_npu_interleave_rope.call_count, 2)
 
-        self.mlp = ParallelDeepseekMLP(hidden_size=self.mock_hidden_size,
-                                       intermediate_size=self.mock_intermediate_size,
-                                       hidden_act=self.mock_hidden_act,
-                                       quant_config=mock_quant_config,
-                                       reduce_results=self.mock_reduce_results,
-                                       prefix=self.mock_prefix,
-                                       comm_group=mock_omni_mlp_tp)
+    @patch("omni.layers.attention.deepseek_mla.tensor_model_parallel_all_gather")
+    @patch("torch.ops.custom.npu_sparse_flash_attention")
+    @patch("torch_npu.npu_interleave_rope")
+    @patch("torch_npu.npu_kv_rmsnorm_rope_cache")
+    @patch('omni.layers.attention.deepseek_mla.model_extra_config',
+    new_callable=lambda: MagicMock(spec=model_extra_config))
+    @patch("vllm.attention.backends.abstract.AttentionMetadata")    
+    def test_forward_decode(self,
+                            mock_attn_meta_data,
+                            mock_model_extra_config,
+                            mock_npu_kv_rmsnorm_rope_cache,
+                            mock_npu_interleave_rope,
+                            mock_npu_sparse_flash_attention,
+                            mock_tp_all_gather
+                            ):
+        
+        mock_bsz = 8
 
-    def tearDown(self):   
-        import vllm.distributed.parallel_state as vllm_ps
-        vllm_ps._MLP_TP = None
+        mock_min_blocks = 1024
+        mock_max_blocks = 8192
 
-    def test_initialization(self):
-        self.assertIsNotNone(self.mlp.gate_up_proj)      
-        self.assertIsNotNone(self.mlp.down_proj)     
-        self.assertIsNotNone(self.mlp.act_fn_obj)      
+        mock_model_extra_config.operator_opt_config.enable_dsa = True
+        mock_model_extra_config.operator_opt_config.use_mlaprolog = False
+        mock_model_extra_config.operator_opt_config.moe_multi_stream_tune = False
+        mock_model_extra_config.operator_opt_config.use_omni_cache = False
+        mock_model_extra_config.parall_config.o_proj_tp_size = 8
 
-        self.assertTrue(hasattr(self.mlp, 'prefix'))
-        self.assertTrue(hasattr(self.mlp, 'quant_symbol'))
-        self.assertTrue(hasattr(self.mlp, 'comm_group'))
+        mock_attn_meta_data.decode.cos.return_value = torch.randn(mock_bsz, 1, 1, 64, dtype=torch.bfloat16)
+        mock_attn_meta_data.decode.sin.return_value = torch.randn(mock_bsz, 1, 1, 64, dtype=torch.bfloat16)
+        mock_attn_meta_data.tmp_slot_mapping.return_value = torch.randint(low=0, high=mock_bsz, size=(mock_bsz,), dtype=torch.int64)
+        mock_attn_meta_data.decode.block_table.return_value = torch.randint(low=0, high=mock_bsz, size=(mock_bsz, mock_bsz), dtype=torch.int32)
+        mock_attn_meta_data.decode.seq_lens.return_value = torch.randint(low=0, high=mock_bsz, size=(mock_bsz,), dtype=torch.int64)
 
-        self.assertEqual(self.mlp.comm_group.rank_in_group, self.mock_rank_in_group)
-        self.assertEqual(self.mlp.comm_group.world_size, self.mock_world_size)
+        mock_positions = torch.randint(low=0, high=mock_bsz, size=(mock_bsz,), dtype=torch.int64)
+        mock_hidden_states = torch.randn(mock_bsz, self.hidden_size, dtype=torch.bfloat16)
 
-    def test_act_fn(self):
-        mock_input = [torch.randint(low=0, high=self.mock_bsz, size=(self.mock_bsz, 4096), dtype=torch.int32),
-                      torch.randn(self.mock_bsz, dtype=torch.float32)]
-        mock_quant_symbol = True
+        mock_kvcache_blocks = random.randint(mock_min_blocks, mock_max_blocks)  
+        mock_kvcache = [torch.randn(mock_kvcache_blocks, 128, 1, self.kv_lora_rank, dtype=torch.bfloat16),
+                        torch.randn(mock_kvcache_blocks, 128, 1, 64, dtype=torch.bfloat16)]
 
-        self.mlp.gate_up_proj.weight_scale = MagicMock(return_value=torch.randn(4096, dtype=torch.float32))
-        self.mlp.act_fn_obj.forward = MagicMock(return_value={"x_int8": torch.randint(low=0, high=128, size=(self.mock_bsz, 2048), dtype=torch.int8),
-                                                                "pertoken_scale":torch.randn(self.mock_bsz, dtype=torch.float32)})
-        result = self.mlp.act_fn(x=mock_input, quant_symbol=mock_quant_symbol)
+        self.mla.norm_res = list(range(128))
+        self.mla.actual_seq_lengths = torch.randint(low=0, high=128, size=(16, 128), dtype=torch.int64)
+        self.mla.num_local_heads = 128
+        self.mla.W_UK = torch.randn(128, 128, self.kv_lora_rank, dtype=torch.bfloat16)
+        self.mla.W_UV = torch.randn(128, self.kv_lora_rank, 128, dtype=torch.bfloat16)
+    
+        mock_tp_all_gather.side_effect = lambda data, dim: data
 
-        self.assertIsInstance(result, dict)
-        self.assertIn('x_int8', result)
-        self.assertIn('pertoken_scale', result)
-        self.assertIsInstance(result['x_int8'], torch.Tensor)
-        self.assertIsInstance(result['pertoken_scale'], torch.Tensor)
+        q_lowrank = torch.randn(mock_bsz, self.q_lora_rank, dtype=torch.bfloat16)   
+        self.mla.q_a_proj.forward = MagicMock(return_value=[q_lowrank])
 
-    def test_forward(self):
-        self.mock_bsz_gather = self.mock_world_size * self.mock_bsz
-        mock_input = torch.randn(self.mock_bsz, self.mock_hidden_size, dtype=torch.bfloat16)
-        self.mlp.quant_symbol = True     
+        latent_cache = torch.randn(mock_bsz, 576, dtype=torch.bfloat16)
+        self.mla.kv_a_proj_with_mqa.forward =  MagicMock(return_value=[latent_cache, None])
 
-        self.mlp.comm_group.all_gather = MagicMock(side_effect=lambda data, dim: data.repeat(self.mock_world_size, 1))
+        self.mla.q_a_layernorm.forward = MagicMock(return_value=[q_lowrank, None])
 
-        self.mlp.gate_up_proj.forward = MagicMock(return_value=[torch.randint(low=0, high=self.mock_bsz_gather, size=(self.mock_bsz_gather, 4608), dtype=torch.int32),
-                                                    torch.randn(self.mock_bsz_gather, dtype=torch.float32)])
-        self.mlp.act_fn = MagicMock(return_value={"x_int8": torch.randint(low=0, high=128, size=(self.mock_bsz_gather, 2304), dtype=torch.int8),
-                                                  "pertoken_scale":torch.randn(self.mock_bsz_gather, dtype=torch.float32)})
-        self.mlp.down_proj.forward = MagicMock(return_value=[torch.randn(self.mock_bsz_gather, self.mock_hidden_size, dtype=torch.bfloat16), None])
+        self.mla.q_b_proj.forward = MagicMock(side_effect=lambda data: [data.repeat(1, 16)])
 
-        self.mlp.comm_group.reduce_scatter = MagicMock(return_value=torch.randn(self.mock_bsz, self.mock_hidden_size, dtype=torch.bfloat16))
+        mock_npu_kv_rmsnorm_rope_cache.return_value = [torch.randn(mock_kvcache_blocks, 128, 1, 64, dtype=torch.bfloat16),
+                                                       torch.randn(mock_kvcache_blocks, 128, 1, self.kv_lora_rank, dtype=torch.bfloat16),
+                                                       None,
+                                                       None]
 
-        result_1 = self.mlp.forward(x=mock_input, residual=None, attn_metadata=None, layerid=None)           
+        mock_npu_interleave_rope.side_effect = lambda data, cos, sin: data
 
-        self.assertIsInstance(result_1, torch.Tensor)
-        self.assertEqual(result_1.shape[0], self.mock_bsz)
-        self.assertEqual(result_1.shape[1], self.mock_hidden_size)
+        self.mla.indexer = MagicMock()
+        self.mla.indexer.return_value = [torch.randint(low=0, high=2048, size=(8, 1, 2048), dtype=torch.int32), None, None]
 
+        mock_npu_sparse_flash_attention.return_value = torch.randn(8, 128, self.kv_lora_rank, dtype=torch.bfloat16)
 
-        mock_residual = return_value=torch.randn(self.mock_bsz_gather, self.mock_hidden_size, dtype=torch.bfloat16)
-        result_2, residual = self.mlp.forward(x=mock_input, residual=mock_residual, attn_metadata=None, layerid=None)           
+        self.mla.o_proj.forward = MagicMock(return_value=[torch.randn(mock_bsz, self.hidden_size, dtype=torch.bfloat16), None])
 
-        self.assertIsInstance(result_2, torch.Tensor)
-        self.assertEqual(result_2.shape[0], self.mock_bsz)
-        self.assertEqual(result_2.shape[1], self.mock_hidden_size)
+        result = self.mla._forward_decode(positions=mock_positions,
+                                            hidden_states=mock_hidden_states,
+                                            kv_cache=mock_kvcache,
+                                            attn_metadata=mock_attn_meta_data,
+                                        )
 
-        self.assertIsInstance(residual, torch.Tensor)
-        self.assertEqual(residual.shape[0], self.mock_bsz_gather)
-        self.assertEqual(residual.shape[1], self.mock_hidden_size)       
+        mock_npu_kv_rmsnorm_rope_cache.assert_called_once()
+        mock_npu_interleave_rope.assert_called_once()               
+        mock_npu_sparse_flash_attention.assert_called_once()
+
+        self.assertEqual(result.shape[0], mock_bsz)
+        self.assertEqual(result.shape[1], self.hidden_size)  
 
 
 if __name__ == "__main__":

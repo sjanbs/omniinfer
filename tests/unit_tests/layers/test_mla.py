@@ -193,10 +193,9 @@ class Test_DeepseekV32_MLA(TestCase):
                                                   comm_group=None
                                                 )
 
-        mock_npu_interleave_rope.assert_called_once()
-
         self.assertEqual(result.shape[0], mock_bsz)
         self.assertEqual(result.shape[1], self.hidden_size)
+        self.assertEqual(mock_npu_interleave_rope.call_count, 2)
 
 
     @patch("omni.layers.attention.deepseek_mla.tensor_model_parallel_all_gather")
