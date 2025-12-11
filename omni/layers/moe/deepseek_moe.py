@@ -154,10 +154,12 @@ class ParallelDeepseekMLP(nn.Module):
             quant_config: Optional[QuantizationConfig] = None,
             reduce_results: bool = True,
             prefix: str = "",
-            comm_group: Optional[GroupCoordinator] = get_mlp_tp_group()
+            comm_group: Optional[GroupCoordinator] = None
     ) -> None:
         super().__init__()
         self.prefix = prefix
+        if comm_group is None:
+            comm_group = get_mlp_tp_group()
         self.gate_up_proj = AscendMergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             tp_size=comm_group.world_size,
