@@ -12,7 +12,7 @@ tp=1
 dp=1
 
 CUR_DIR = Path(__file__).parent
-model_path=f"{CUR_DIR}/fake_new/"
+model_path=f"{CUR_DIR}/mock_model/"
 
 def graceful_kill_vllm(timeout=10):
     """
