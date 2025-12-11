@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 export COVERAGE_RCFILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.coveragerc"
+pip install pytest-cov diff-cover
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -39,7 +40,6 @@ report_name="pytest-all.xml"
 
 case "${target}" in
   unit)
-    marker_args=(-m "unit and not gpu")
     target_path="${SCRIPT_DIR}/unit_tests"
     report_name="pytest-unit.xml"
     ;;
@@ -59,7 +59,9 @@ esac
 cmd=(
   pytest 
   "${marker_args[@]}" 
+  --tb=no -v
   "${target_path}"
+  --cov
   --cov-report=html
   --cov-report=xml
   "${extra_args[@]}"
