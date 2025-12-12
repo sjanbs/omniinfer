@@ -283,6 +283,80 @@ class Test_DeepseekV32_MLA(TestCase):
         self.assertEqual(result.shape[0], mock_bsz)
         self.assertEqual(result.shape[1], self.hidden_size)  
 
+    @patch("omni.layers.attention.deepseek_mla.get_o_proj_dp_group")
+    @patch("omni.layers.attention.deepseek_mla.tensor_model_parallel_all_gather")
+    @patch("omni.layers.attention.deepseek_mla.mla_tensor_model_parallel_all_gather")
+    @patch("torch_npu.npu_interleave_rope")
+    def test_forward_prefill(self,
+                              mock_interleave,
+                              mock_mla_all_gather,
+                              mock_tensor_all_gather,
+                              mock_o_proj_group):
+        mock_bsz = 8
+        positions = torch.randint(low=0, high=16, size=(mock_bsz,), dtype=torch.int64)
+        hidden_states = torch.randn(mock_bsz, self.hidden_size, dtype=torch.bfloat16)
+
+        self.mla.merge_qkv = False
+        self.mla.quant_symbol = False
+        self.mla.model_parallel = True
+        self.mla.o_proj.forward = MagicMock(return_value=[torch.randn(mock_bsz, self.hidden_size, dtype=torch.bfloat16)])
+
+        self.mla.q_a_proj.forward = MagicMock(return_value=[torch.randn(mock_bsz, self.q_lora_rank, dtype=torch.bfloat16)])
+        latent_cache = torch.randn(mock_bsz, self.kv_lora_rank + self.qk_rope_head_dim, dtype=torch.bfloat16)
+        self.mla.kv_a_proj_with_mqa.forward = MagicMock(return_value=[latent_cache])
+        self.mla.q_a_layernorm.forward = MagicMock(side_effect=lambda data: data)
+        self.mla.q_b_proj.forward = MagicMock(
+            return_value=torch.randn(mock_bsz, self.num_heads, self.qk_head_dim, dtype=torch.bfloat16)
+        )
+        self.mla.kv_a_layernorm.forward = MagicMock(side_effect=lambda data: data)
+
+        mock_mla_all_gather.side_effect = lambda data, dim, comm_group=None: data
+        mock_tensor_all_gather.side_effect = lambda data, dim: data
+        mock_interleave.side_effect = lambda data, cos, sin: data
+        mock_o_proj_group.return_value = MagicMock(world_size=1)
+
+        model_extra_config.operator_opt_config.prefill_enable_mla_alltoall = False
+        model_extra_config.parall_config.o_proj_tp_size = 1
+
+        output = self.mla._forward_prefill(
+            positions=positions,
+            hidden_states=hidden_states,
+            kv_cache=None,
+            attn_metadata=None,
+            comm_group=None,
+        )
+
+        self.assertEqual(output.shape[0], mock_bsz)
+        self.assertEqual(output.shape[1], self.hidden_size)
+        self.assertTrue(mock_interleave.called)
+
+    @patch("omni.layers.attention.deepseek_mla.os.getenv", side_effect=["A3", None])
+    def test_forward_dispatch_and_prolog(self, mock_getenv):
+        attn_metadata = MagicMock()
+        attn_metadata.prefill = MagicMock()
+
+        self.mla.is_init = False
+        self.mla.enable_graph_mode = False
+        self.mla.kv_scale_reci_tile = torch.randn(1, self.kv_lora_rank, dtype=torch.bfloat16)
+        self.mla.is_mla_prolog_init = False
+        model_extra_config.operator_opt_config.enable_dsa = False
+
+        expected = torch.randn(2, self.hidden_size, dtype=torch.bfloat16)
+        self.mla._forward_prefill = MagicMock(return_value=expected)
+        self.mla._process_mla_prolog_weight = MagicMock(side_effect=lambda w: w)
+
+        result = self.mla.forward(
+            positions=torch.tensor([0, 1]),
+            hidden_states=torch.randn(2, self.hidden_size, dtype=torch.bfloat16),
+            kv_cache=None,
+            attn_metadata=attn_metadata,
+        )
+
+        self.assertTrue(torch.equal(result, expected))
+        self.mla._forward_prefill.assert_called_once()
+        self.assertTrue(self.mla.is_mla_prolog_init)
+        self.assertGreaterEqual(self.mla._process_mla_prolog_weight.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
