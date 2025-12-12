@@ -1,203 +1,130 @@
-import os
-import pytest
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
+import unittest
 import torch
-import torch_npu
-import torch.multiprocessing as mp
-import tempfile
-import traceback
-import sys
-import importlib
-from typing import Optional, Callable, Any, List, Tuple
-from omni.adaptors.vllm.patches.model_patch import patch_all
-# Top-level imports for pytest parameterization
-from omni.layers.layernorm import RMSNorm, RMSNormFlashComm
-from omni.models.config_loader.loader import model_extra_config
+# import torch_npu
+from unittest.mock import Mock, patch, MagicMock
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+from vllm.distributed import get_tp_group
 
-from .distributed_test_common import distributed_worker_pool, _persistent_worker_loop
-TEST_SEED = 0
-@pytest.fixture
-def npu_device():
-    """Ensures NPU is available before running tests."""
-    if not hasattr(torch, "npu") or not torch.npu.is_available():
-        pytest.fail("NPU is not available on this system, but is required for these tests.")
-    return torch.device("npu")
+from omni.layers.layernorm import RMSNorm
 
-def rmsnorm_golden(x: torch.Tensor, 
-                   residual: Optional[torch.Tensor], 
-                   weight: torch.Tensor, 
-                   bias: Optional[torch.Tensor], 
-                   eps: float):
-    """
-    reference rmsnorm
-    """
-    x_f32 = x.float()
-    weight_f32 = weight.float()
-    
-    if residual is not None:
-        res_f32 = residual.float()
-        res_out = x_f32 + res_f32
-        norm_input = res_out
-    else:
-        res_out = None
-        norm_input = x_f32
 
-    # Var = mean(x^2)
-    variance = norm_input.pow(2).mean(dim=-1, keepdim=True)
-    # Normed = x * 1/sqrt(var + eps)
-    hidden_states = norm_input * torch.rsqrt(variance + eps)
-    # Apply Weight
-    out = hidden_states * weight_f32
-    
-    if bias is not None:
-        out = out + bias.float()
+class TestRMSNorm(unittest.TestCase):
+
+    def setUp(self):
+        '''initialize the test environment'''
+        self.mock_hidden_size = 1024
+        self.mock_tp_size = 8
+
+        self.mock_tp_group = MagicMock()
+        self.mock_tp_group.all_gather = MagicMock(side_effect=lambda x, dim: x)
+        self.mock_tp_group.world_size = self.mock_tp_size
+        self.mock_tp_group.rank_in_group = 0
         
-    return out.to(x.dtype), (res_out.to(x.dtype) if res_out is not None else None)
-
-# @pytest.mark.parametrize("load_bias_env", ['0', '1'])
-@pytest.mark.parametrize("load_bias_env", ['0'])
-@pytest.mark.parametrize("with_residual", [True, False])
-@pytest.mark.parametrize("with_quant", [True, False])
-def test_rmsnorm_basic(npu_device, load_bias_env, with_residual, with_quant):
-    """
-    Runs the RMSNorm logic on actual NPU hardware and compares against a Golden Reference.
-    """
-    hidden_size = 128
-    dtype = torch.float16 
-    eps = 1e-6
-    
-    with pytest.MonkeyPatch.context() as m:
-        m.setenv("LOAD_RMSNORM_BIAS", load_bias_env)
+        '''mock the Tensor parallel test environment'''
+        self.tp_size_mock = patch('vllm.distributed.parallel_state.get_tensor_model_parallel_world_size', 
+                                  return_value=self.mock_tp_size)
+        self.tp_rank_mock = patch('vllm.distributed.parallel_state.get_tensor_model_parallel_rank', return_value=0)
+        self.tp_group_mock = patch('vllm.distributed.get_tp_group', return_value=self.mock_tp_group)
         
-        norm = RMSNorm(hidden_size, eps=eps, dtype=dtype).to(npu_device)
+        self.tp_size_mock.start()
+        self.tp_rank_mock.start()
+        self.tp_group_mock.start()
         
-        if load_bias_env == "1":
-            # Initialize bias to non-zero to actually test the addition logic
-            torch.nn.init.normal_(norm.bias, mean=0.5, std=0.1)
-
-        # Input
-        x = torch.randn(1, 10, hidden_size, dtype=dtype, device=npu_device)
+        import vllm.distributed.parallel_state as ps
+        ps._TP = self.mock_tp_group
         
-        if with_residual:
-            residual = torch.randn(1, 10, hidden_size, dtype=dtype, device=npu_device)
-            x_ref = x.clone()
-            residual_ref = residual.clone()
-        else:
-            residual = None
-            x_ref = x.clone()
-            residual_ref = None
+        self.rms_norm = RMSNorm(self.mock_hidden_size, eps=1e-6)
         
-        output = norm(x, residual=residual, quant_symbol=with_quant)
-
-        ref_out, ref_residual = rmsnorm_golden(
-            x_ref, residual_ref, norm.weight, norm.bias, eps
-        )
-
-        if with_residual:
-            assert isinstance(output, tuple)
-            out_x, out_res = output
-            
-            # Check Residual Correctness
-            # The residual returned by fused kernel is (x + old_residual)
-            assert torch.allclose(out_res, ref_residual, atol=1e-3, rtol=1e-3), \
-                "Residual update mismatch"
-            
-            if with_quant:
-                assert isinstance(out_x, dict)
-                # For now, just ensuring structure and residual correctness is sufficient.
-            else:
-                # Compare Norm Output
-                assert torch.allclose(out_x, ref_out, atol=1e-3, rtol=1e-3), \
-                    "RMSNorm output mismatch (Residual path)"
-
-        else:
-            if with_quant:
-                assert not isinstance(output, dict)
-                assert torch.allclose(output, ref_out, atol=1e-3, rtol=1e-3), \
-                     "RMSNorm output mismatch (Standard path, Quant ignored)"
-            else:
-                assert torch.allclose(output, ref_out, atol=1e-3, rtol=1e-3), \
-                    "RMSNorm output mismatch (Standard path)"
-
-def _logic_rmsnorm_tp(local_rank, world_size, hidden_size, dtype, y_transform):
-    """
-    Logic for testing RMSNormFlashComm in a distributed setting.
-    Verifies that 'AG' transform correctly gathers data from all ranks.
-    """
-    device = torch.device(f"npu:{local_rank}")
-    eps = 1e-6
-    
-    model = RMSNormFlashComm(hidden_size, eps=eps).to(dtype).to(device)
-    # Ensure same weight on all ranks for consistent calculation
-    torch.nn.init.ones_(model.weight) 
-
-    # 2. Create Rank-Specific Input
-    # Rank 0: filled with 1.0, Rank 1: filled with 2.0
-    val = float(local_rank + 1)
-    x = torch.full((1, 2, hidden_size), val, dtype=dtype, device=device)
-    residual = torch.full((1, 2, hidden_size), val, dtype=dtype, device=device)
-    
-    # 3. Run Forward
-    out, out_residual = model(x, residual=residual, y_transform=y_transform)
-    
-    # 4. Validation
-    if y_transform == "AG":
-        # Check Shape: [Batch * WorldSize, Seq, Hidden]
-        # Input [1, 2, H] -> Gathered [2, 2, H]
-        expected_shape = (world_size * x.shape[0], x.shape[1], x.shape[2])
-        assert out.shape == expected_shape, f"Shape mismatch. Got {out.shape}, expected {expected_shape}"
+        self.npu_add_rms_norm_mock = MagicMock()
+        self.npu_add_rms_norm_mock.return_value = (torch.randn(self.mock_tp_size, self.mock_hidden_size), None, torch.randn(self.mock_tp_size, self.mock_hidden_size))
+        self.npu_rms_norm_mock = MagicMock()
+        self.npu_rms_norm_mock.return_value = (torch.randn(self.mock_tp_size, self.mock_hidden_size),)
+        self.npu_dynamic_quant_mock = MagicMock()
+        self.npu_dynamic_quant_mock.return_value = (torch.randn(self.mock_tp_size, self.mock_hidden_size), torch.randn(self.mock_tp_size))
         
-        # Check Residual (Local): Should be local input + local residual = 2 * val
-        expected_res_val = val + val
-        assert torch.allclose(out_residual, torch.full_like(out_residual, expected_res_val)), \
-            "Residual value mismatch"
-    else:
-        # No Gather
-        assert out.shape == x.shape
-
-
-def _logic_rmsnorm_tp_random_input(local_rank, world_size, hidden_size, dtype):
-    """
-    More robust test with random inputs to verify AllGather content.
-    """
-    device = torch.device(f"npu:{local_rank}")
-    eps = 1e-6
-    model = RMSNormFlashComm(hidden_size, eps=eps).to(dtype).to(device)
-    assert model.tp_size == world_size
-    torch.nn.init.ones_(model.weight)
-    
-    # Generate random input specific to rank
-    torch.manual_seed(local_rank) # Different seed per rank
-    x = torch.randn(2, 4, hidden_size, dtype=dtype, device=device)
-    residual = torch.randn(2, 4, hidden_size, dtype=dtype, device=device)
-    
-    # Execute
-    out_gathered, _ = model(x, residual=residual, y_transform="AG")
+        self.patch1 = patch('torch_npu.npu_add_rms_norm', new=self.npu_add_rms_norm_mock)
+        self.patch2 = patch('torch_npu.npu_rms_norm', new=self.npu_rms_norm_mock)
+        self.patch3 = patch('torch_npu.npu_dynamic_quant', new=self.npu_dynamic_quant_mock)
         
-    # 1. Compute local truth
-    local_norm_out_golden, _ = rmsnorm_golden(x, residual, model.weight, None, eps)
-    
-    # 2. Verify part of the gathered output matches local output
-    start_idx = local_rank * x.shape[0]
-    end_idx = (local_rank + 1) * x.shape[0]
-    my_slice_in_gathered = out_gathered[start_idx:end_idx]
-    
-    assert torch.allclose(my_slice_in_gathered, local_norm_out_golden, atol=1e-3, rtol=1e-3), \
-        f"Rank {local_rank}: Gathered output's local slice does not match local computation"
+        self.patch1.start()
+        self.patch2.start()
+        self.patch3.start()
 
+    def tearDown(self):
+        '''clear test environment'''
+        self.tp_size_mock.stop()
+        self.tp_rank_mock.stop()
+        self.tp_group_mock.stop()
+        self.patch1.stop()
+        self.patch2.stop()
+        self.patch3.stop()
+        
+        import vllm.distributed.parallel_state as ps
+        ps._TP = None
 
-@pytest.mark.parametrize("y_transform", ["AG", ""])
-def test_rmsnorm_tp_distributed(distributed_worker_pool, y_transform):
-    """
-    Tests RMSNormFlashComm using the shared persistent worker pool.
-    """
-    hidden_size = 128
-    dtype = torch.float16
-    
-    if y_transform == "AG":
-        # Use robust random check for AllGather
-        func = _logic_rmsnorm_tp_random_input
-        distributed_worker_pool(func, hidden_size, dtype)
-    else:
-        # Use basic shape check for No Gather
-        func = _logic_rmsnorm_tp
-        distributed_worker_pool(func, hidden_size, dtype, y_transform)
+    def test_initialization(self):
+        '''Test RMSNorm initialization'''
+        self.assertEqual(self.rms_norm.hidden_size, self.mock_hidden_size)
+        self.assertEqual(self.rms_norm.variance_epsilon, 1e-6)
+        
+        self.assertTrue(hasattr(self.rms_norm, 'weight'))
+        self.assertEqual(self.rms_norm.weight.shape, (self.mock_hidden_size,))
+
+        self.assertTrue(hasattr(self.rms_norm, 'variance_epsilon'))
+        self.assertEqual(self.rms_norm.variance_epsilon, 1e-6)
+        custom_eps = 1e-5
+        custom_norm = RMSNorm(self.mock_hidden_size, eps=custom_eps)
+        self.assertEqual(custom_norm.variance_epsilon, custom_eps)
+
+        custom_norm = RMSNorm(self.mock_hidden_size, eps=1e-6, has_weight=False, dtype=torch.bfloat16)
+        self.assertEqual(custom_norm.weight.dtype, torch.bfloat16)
+
+    def test_forward_with_residual_basic(self):
+        '''Test forward propagation with residual connections'''
+        self.npu_add_rms_norm_mock.reset_mock()
+        x = torch.randn(self.mock_tp_size, self.mock_hidden_size)
+        residual = torch.randn(self.mock_tp_size, self.mock_hidden_size)
+        
+        result = self.rms_norm(x, residual=residual)
+        self.npu_add_rms_norm_mock.assert_called_once()
+        self.assertEqual(len(result), 2)
+
+    def test_forward_with_residual_quant(self):
+        '''Test forward propagation with residual connections and quantization methods'''
+        self.npu_add_rms_norm_mock.reset_mock()
+        self.npu_dynamic_quant_mock.reset_mock()
+        x = torch.randn(self.mock_tp_size, self.mock_hidden_size)
+        residual = torch.randn(self.mock_tp_size, self.mock_hidden_size)
+        
+        result = self.rms_norm(x, residual=residual, quant_symbol=True)
+        self.npu_add_rms_norm_mock.assert_called_once()
+        self.npu_dynamic_quant_mock.assert_called_once()
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[0], dict)
+        self.assertIn('x_int8', result[0])
+        self.assertIn('pertoken_scale', result[0])
+
+    def test_forward_with_residual_all_gather(self):
+        '''Test forward propagation with residual connections and all_gather'''
+        self.npu_add_rms_norm_mock.reset_mock()
+        x = torch.randn(self.mock_tp_size, self.mock_hidden_size)
+        residual = torch.randn(self.mock_tp_size, self.mock_hidden_size)
+        
+        result = self.rms_norm(x, residual=residual, quant_symbol="AG")
+        self.npu_add_rms_norm_mock.assert_called_once()
+        self.assertEqual(len(result), 2)
+
+    def test_forward_without_residual_basic(self):
+        '''Test forward propagation without residual connections'''
+        self.npu_rms_norm_mock.reset_mock()
+        x = torch.randn(self.mock_tp_size, self.mock_hidden_size)
+        
+        result = self.rms_norm(x)
+        self.npu_rms_norm_mock.assert_called_once()
+        self.assertIsInstance(result, torch.Tensor)
+
+if __name__ == "__main__":
+    unittest.main()

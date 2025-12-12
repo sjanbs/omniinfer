@@ -15,6 +15,7 @@ class _HfExamplesInfo:
     model_cls: type[nn.Module]
     hf_config: PretrainedConfig
     init_patch_context_fn: Callable[[], Iterator[None]]
+    prompt_token_ids: list[int]
 
     @contextmanager
     def init_patch_context(self) -> Iterator[None]:
@@ -79,7 +80,9 @@ _TRANSFORMERS_MODELS = {
     "DeepseekV3ForCausalLM": _HfExamplesInfo(
         model_cls=DeepseekV3ForCausalLM,
         hf_config=config_DeepseekV3ForCausalLM,
-        init_patch_context_fn=init_patch_context_DeepseekV3ForCausalLM),
+        init_patch_context_fn=init_patch_context_DeepseekV3ForCausalLM,
+        prompt_token_ids=[0, 128803, 122294, 1148, 128804, 128798, 201], # 你是谁？
+    ),
 }
 
 _EXAMPLE_MODELS = {
@@ -112,3 +115,4 @@ class HfExampleModels:
 
 
 HF_EXAMPLE_MODELS = HfExampleModels(_EXAMPLE_MODELS)
+
