@@ -330,6 +330,102 @@ class Test_DeepseekV32_MLA(TestCase):
         self.assertEqual(output.shape[1], self.hidden_size)
         self.assertTrue(mock_interleave.called)
 
+    def test_forward_mlaprolog_decode(self, mock_v3, mock_v2):
+        bsz = 2
+        block_num, block_size = 1, 2
+        nz_block_size = 16
+
+        nope_cache = torch.randn(block_num, block_size, 1, self.kv_lora_rank, dtype=torch.bfloat16)
+        rope_cache = torch.randn(block_num, block_size, 1, self.qk_rope_head_dim, dtype=torch.bfloat16)
+
+        attn_metadata = MagicMock()
+        attn_metadata.decode.cos = torch.randn(bsz, 1, 1, self.qk_rope_head_dim, dtype=torch.bfloat16)
+        attn_metadata.decode.sin = torch.randn(bsz, 1, 1, self.qk_rope_head_dim, dtype=torch.bfloat16)
+        attn_metadata.slot_mapping = torch.arange(bsz, dtype=torch.int32).view(bsz, 1)
+
+        q_nope = torch.randn(bsz * self.mla.num_local_heads, self.kv_lora_rank, dtype=torch.bfloat16)
+        q_pe = torch.randn(bsz * self.mla.num_local_heads, self.qk_rope_head_dim, dtype=torch.bfloat16)
+        dequant_scale_q_nope = torch.randn(1, dtype=torch.bfloat16)
+        q_norm = torch.randn(bsz * self.mla.num_local_heads, self.q_lora_rank, dtype=torch.bfloat16)
+        dequant_scale_q_norm = torch.randn(1, dtype=torch.bfloat16)
+
+        mock_v3.return_value = (
+            q_nope,
+            q_pe,
+            dequant_scale_q_nope,
+            q_norm,
+            dequant_scale_q_norm,
+        )
+
+        hidden_states = torch.randn(bsz, self.hidden_size, dtype=torch.bfloat16)
+        output = self.mla._forward_mlaprolog_decode(
+            hidden_states=hidden_states,
+            nope_cache=nope_cache,
+            rope_cache=rope_cache,
+            attn_metadata=attn_metadata,
+            nz_block_size=nz_block_size,
+        )
+
+        mock_v3.assert_called_once()
+        self.assertEqual(mock_v3.call_args.kwargs["cache_mode"], "PA_BSND")
+        self.assertEqual(output[0].shape, (bsz, self.mla.num_local_heads, self.kv_lora_rank))
+        self.assertEqual(output[1].shape, (bsz, self.mla.num_local_heads, self.qk_rope_head_dim))
+        self.assertIs(output[3], nope_cache)
+        self.assertIs(output[4], rope_cache)
+
+        self.mla.model_parallel = False
+        self.mla.quant_symbol = False
+        model_extra_config.operator_opt_config.enable_dsa = False
+        model_extra_config.operator_opt_config.use_omni_cache = False
+
+        k_nope = torch.randn(
+            block_num,
+            self.kv_lora_rank // nz_block_size,
+            block_size,
+            nz_block_size,
+            dtype=torch.bfloat16,
+        )
+        k_rope = torch.randn(
+            block_num,
+            self.qk_rope_head_dim // 16,
+            block_size,
+            16,
+            dtype=torch.bfloat16,
+        )
+
+        mock_v2.return_value = (
+            q_nope,
+            q_pe,
+            k_nope,
+            k_rope,
+            dequant_scale_q_nope,
+        )
+
+        output = self.mla._forward_mlaprolog_decode(
+            hidden_states=hidden_states,
+            nope_cache=nope_cache,
+            rope_cache=rope_cache,
+            attn_metadata=attn_metadata,
+            nz_block_size=nz_block_size,
+        )
+
+        mock_v2.assert_called_once()
+        self.assertEqual(mock_v2.call_args.kwargs["cache_mode"], "PA_NZ")
+        self.assertEqual(
+            output[3].shape,
+            (block_num, 1, self.kv_lora_rank // nz_block_size, block_size, nz_block_size),
+        )
+        self.assertEqual(
+            output[4].shape,
+            (
+                block_num,
+                1,
+                self.qk_rope_head_dim // 16,
+                block_size,
+                16,
+            ),
+        )
+
     @patch("omni.layers.attention.deepseek_mla.os.getenv", side_effect=["A3", None])
     def test_forward_dispatch_and_prolog(self, mock_getenv):
         attn_metadata = MagicMock()
