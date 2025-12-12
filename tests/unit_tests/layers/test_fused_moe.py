@@ -674,7 +674,89 @@ class test_DeepseekMoE(TestCase):
         self.assertEqual(len(result), 2)
         self.assertIs(result[0], dispatched_output)
         self.assertIs(result[1], mock_residual)
+                                                
+    @patch('omni.layers.moe.deepseek_moe.get_ep_group')
+    def test_forward_separate_expert_prefill(self, mock_ep_group):
+        mock_hidden_states, mock_residual = self._create_hidden_and_residual(self.mock_prefill_bsz)
+        mock_global_states = torch.randn(self.mock_prefill_bsz * 2, self.mock_hidden_size, dtype=torch.float32)
 
+        reduce_shared = torch.randn_like(mock_hidden_states)
+        reduce_final = torch.randn_like(mock_hidden_states)
+
+        mock_ep_group.return_value.all_gather.return_value = mock_global_states
+        mock_ep_group.return_value.reduce_scatter.side_effect = [reduce_shared, reduce_final]
+
+        self.moe.shared_experts = None
+        self.moe.experts = None
+
+        output, residual = self.moe.forward_separate_expert_prefill(
+            hidden_states=mock_hidden_states,
+            residual=mock_residual,
+            attn_metadata=MagicMock(),
+        )
+
+        mock_ep_group.return_value.all_gather.assert_called_once_with(mock_hidden_states, dim=0)
+        self.assertEqual(mock_ep_group.return_value.reduce_scatter.call_count, 2)
+        torch.testing.assert_close(output, reduce_final + reduce_shared)
+        torch.testing.assert_close(residual, mock_residual)
+
+    def test_chunked_gmm(self):
+        mock_chunk_size = 2
+        hidden_states = torch.randn(5, self.mock_hidden_size, dtype=torch.float32)
+        topk_weights = torch.randn(5, self.mock_ep_size, dtype=torch.float32)
+        topk_ids = torch.randint(low=0, high=self.mock_ep_size, size=(5, self.mock_ep_size), dtype=torch.int32)
+        pertoken_scale = torch.randn(5, dtype=torch.float32)
+        attn_metadata = MagicMock()
+
+        def _expert_side_effect(hidden_states, **_):
+            return hidden_states + 1
+
+        self.moe.experts.forward = MagicMock(side_effect=_expert_side_effect)
+
+        output = self.moe.chunked_gmm(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            pertoken_scale=pertoken_scale,
+            attn_metadata=attn_metadata,
+            chunk_size=mock_chunk_size,
+        )
+
+        expected = torch.cat([
+            hidden_states[:2] + 1,
+            hidden_states[2:4] + 1,
+            hidden_states[4:] + 1,
+        ])
+
+        self.assertEqual(self.moe.experts.forward.call_count, 3)
+        torch.testing.assert_close(output, expected)
+
+    def test_chunked_gmm_no_split(self):
+        hidden_states = torch.randn(2, self.mock_hidden_size, dtype=torch.float32)
+        topk_weights = torch.randn(2, self.mock_ep_size, dtype=torch.float32)
+        topk_ids = torch.randint(low=0, high=self.mock_ep_size, size=(2, self.mock_ep_size), dtype=torch.int32)
+        pertoken_scale = torch.randn(2, dtype=torch.float32)
+        attn_metadata = MagicMock()
+
+        expected = torch.randn_like(hidden_states)
+        self.moe.experts.forward = MagicMock(return_value=expected)
+
+        output = self.moe.chunked_gmm(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            pertoken_scale=pertoken_scale,
+            attn_metadata=attn_metadata,
+            chunk_size=hidden_states.shape[0],
+        )
+
+        self.moe.experts.forward.assert_called_once_with(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            pertoken_scale=pertoken_scale,
+            attn_metadata=attn_metadata,
+        )
 
 if __name__ == "__main__":
     unittest.main()
