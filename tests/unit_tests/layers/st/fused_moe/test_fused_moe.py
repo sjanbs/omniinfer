@@ -26,7 +26,9 @@ FIRST_DIE, _ = parse_ascend_devices()
 # --- Fixtures ---
 @pytest.fixture
 def npu_device():
-    return torch.device(f"npu:{FIRST_DIE}")
+    device = torch.device(f"npu:{FIRST_DIE}")
+    torch.npu.set_device(device)
+    return device
 
 from unittest.mock import MagicMock, patch
 from typing import Optional, List, Tuple

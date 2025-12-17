@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import os
 
 torch_npu = pytest.importorskip("torch_npu")
 
@@ -23,7 +24,6 @@ from omni.layers.attention.backend.attention_dummy_builder import (
 
 
 def parse_ascend_devices():
-    import os
     # Get the environment variable, default to empty string if not found
     env_val = os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '')
     
@@ -33,12 +33,13 @@ def parse_ascend_devices():
     try:
         # Split by comma and convert to integers
         visible_die_list = [int(x.strip()) for x in env_val.split(',') if x.strip()]
-        first_die_no = visible_die_list[0] if visible_die_list else None
+        device_no_list = sorted(list(set(x // 2 for x in visible_die_list)))
+        first_device_no = device_no_list[0]
     except ValueError as e:
         print(f"Error parsing ASCEND_RT_VISIBLE_DEVICES: {e}, using default values.")
         return 0, [0, 1]
 
-    return first_die_no, visible_die_list
+    return first_device_no, device_no_list
 
 # ---- Lightweight test doubles -------------------------------------------------
 
