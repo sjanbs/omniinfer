@@ -9,7 +9,8 @@ from unittest.mock import patch
 from typing import Callable, Iterator
 
 from omni.models.deepseek.deepseek_v3 import DeepseekV3ForCausalLM
-
+from omni.models.deepseek.deepseek_v32 import DeepseekV32ForCausalLM
+from omni.models.pangu.pangu_pro_moe_v2.pangu_moe_v2 import PanguProMoEV2ForCausalLM
 @dataclass(frozen=True)
 class _HfExamplesInfo:
     model_cls: type[nn.Module]
@@ -66,8 +67,156 @@ config_DeepseekV3ForCausalLM = PretrainedConfig(
                         "original_max_position_embeddings": 4096,
                         "type": "yarn"
                     },
-        quantization_config=None
+        quantization_config=None # overwritten when enable_quant=True
     )
+
+config_DeepseekV31ForCausalLM = PretrainedConfig(
+    attention_bias=False,
+    attention_dropout=0.0,
+    hidden_size=512,
+    intermediate_size=256,
+    num_hidden_layers=2,
+    num_attention_heads=8,
+    num_key_value_heads=8,
+    hidden_act="silu",
+    rms_norm_eps=1e-6,
+    initializer_range=0.02,
+    max_position_embeddings=2048,
+    rope_theta=10000.0,
+    rope_scaling={
+        "type": "yarn",
+        "factor": 40,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+        "original_max_position_embeddings": 4096,
+    },
+    q_lora_rank=512,
+    kv_lora_rank=512,
+    qk_nope_head_dim=128,
+    qk_rope_head_dim=64,
+    v_head_dim=128,
+    n_routed_experts=4,
+    n_shared_experts=1,
+    moe_intermediate_size=256,
+    num_experts_per_tok=2,
+    moe_layer_freq=1,
+    routed_scaling_factor=1.0,
+    first_k_dense_replace=1,
+    topk_method="noaux_tc",
+    scoring_func="sigmoid",
+    norm_topk_prob=True,
+    n_group=1,
+    topk_group=1,
+    num_nextn_predict_layers=1,
+    tie_word_embeddings=False,
+    use_cache=True,
+    torch_dtype=torch.bfloat16,
+    vocab_size=10000,
+    bos_token_id=0,
+    eos_token_id=1,
+    model_type="deepseek_v3",
+    quantization_config=None,  # overwritten when enable_quant=True
+)
+
+config_DeepseekV32ForCausalLM = PretrainedConfig(
+    attention_bias=False,
+    attention_dropout=0.0,
+    hidden_act="silu",
+    hidden_size=512,
+    intermediate_size=256,
+    num_hidden_layers=2,
+    num_attention_heads=8,
+    num_key_value_heads=8,
+    max_position_embeddings=2048,
+    rms_norm_eps=1e-6,
+    initializer_range=0.02,
+    model_type="deepseek_v32",
+    n_routed_experts=4,
+    n_shared_experts=1,
+    moe_intermediate_size=256,
+    num_experts_per_tok=2,
+    moe_layer_freq=1,
+    routed_scaling_factor=1.0,
+    first_k_dense_replace=1,
+    n_group=1,
+    topk_group=1,
+    topk_method="noaux_tc",
+    scoring_func="sigmoid",
+    norm_topk_prob=True,
+    q_lora_rank=512,
+    kv_lora_rank=512,
+    qk_nope_head_dim=128,
+    qk_rope_head_dim=64,
+    v_head_dim=128,
+    rope_theta=10000.0,
+    rope_scaling={
+        "type": "yarn",
+        "factor": 40,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+        "original_max_position_embeddings": 4096,
+    },
+    vocab_size=10000,
+    tie_word_embeddings=False,
+    bos_token_id=0,
+    eos_token_id=1,
+    num_nextn_predict_layers=1,
+    use_cache=True,
+    torch_dtype=torch.bfloat16,
+    quantization_config=None
+)
+
+from transformers import PretrainedConfig
+import torch
+
+
+config_PanguProMoEV2ForCausalLM = PretrainedConfig(
+    architectures=["PanguProMoEV2ForCausalLM"],
+    model_type="PanguProMoE",
+    attention_dropout=0.0,
+    mlp_only_layers=[0, 1, 2, 3],
+    bos_token_id=0,
+    eos_token_id=1,
+    hidden_act="silu",
+    hidden_size=512,
+    intermediate_size=256,
+    initializer_range=0.02,
+    num_hidden_layers=2,
+    num_attention_heads=8,
+    num_key_value_heads=4,
+    max_position_embeddings=2048,
+    rope_theta=10000.0,
+    rms_norm_eps=1e-5,
+    sandwich_norm=True,
+    # MoE related
+    num_experts=8,
+    num_experts_per_tok=2,
+    moe_intermediate_size=256,
+    shared_expert_intermediate_size=512,
+    routed_scaling_factor=2.5,
+    router_enable_expert_bias=True,
+    norm_topk_prob=True,
+    output_router_logits=False,
+    # Attention head dims
+    qk_nope_dim=128,
+    qk_rope_dim=64,
+    v_channels=128,
+    # MTP (multi-token prediction)
+    num_mtp_layers=1,
+    # Param sink
+    param_sink_number=128,
+    param_sink_with_value=True,
+    tie_word_embeddings=False,
+    use_cache=True,
+    torch_dtype=torch.bfloat16,
+    vocab_size=10000,
+    quantization_config=None
+)
+
 
 @contextmanager
 def init_patch_context_DeepseekV3ForCausalLM() -> Iterator[None]:
@@ -77,12 +226,39 @@ def init_patch_context_DeepseekV3ForCausalLM() -> Iterator[None]:
     with patch("omni.layers.attention.deepseek_mla.get_dp_group", return_value=MockDpGroup()):
         yield
 
+@contextmanager
+def init_patch_context_PanguProMoEV2ForCausalLM() -> Iterator[None]:
+    class MockDpGroup:
+        def __init__(self):
+            self.world_size = 2
+    with patch(
+        "omni.models.pangu.pangu_pro_moe_v2.pangu_moe_v2.get_dp_group", return_value=MockDpGroup(),):
+        yield
+
 _TRANSFORMERS_MODELS = {
     "DeepseekV3ForCausalLM": _HfExamplesInfo(
         model_cls=DeepseekV3ForCausalLM,
         hf_config=config_DeepseekV3ForCausalLM,
         init_patch_context_fn=init_patch_context_DeepseekV3ForCausalLM,
         prompt_token_ids=[0, 128803, 122294, 1148, 128804, 128798, 201], # 你是谁？
+    ),
+    "DeepseekV31ForCausalLM": _HfExamplesInfo(
+        model_cls=DeepseekV3ForCausalLM,
+        hf_config=config_DeepseekV31ForCausalLM,
+        init_patch_context_fn=init_patch_context_DeepseekV3ForCausalLM,
+        prompt_token_ids=[0, 128803, 122294, 1148, 128804, 128798, 201],
+    ),
+    "DeepseekV32ForCausalLM": _HfExamplesInfo(
+        model_cls=DeepseekV32ForCausalLM,
+        hf_config=config_DeepseekV32ForCausalLM,
+        init_patch_context_fn=init_patch_context_DeepseekV3ForCausalLM,
+        prompt_token_ids=[0, 128803, 122294, 1148, 128804, 128798, 201],
+    ),
+    "PanguProMoEV2ForCausalLM": _HfExamplesInfo(
+        model_cls=PanguProMoEV2ForCausalLM,
+        hf_config=config_PanguProMoEV2ForCausalLM,
+        init_patch_context_fn=init_patch_context_PanguProMoEV2ForCausalLM,
+        prompt_token_ids=[0, 128803, 122294, 1148, 128804, 128798, 201],
     ),
 }
 

@@ -35,6 +35,19 @@ class NPUDeviceProperties:
         self.multi_processor_count = self.properties.multi_processor_count \
             if hasattr(self.properties, 'multi_processor_count') else 0
 
+class FakeKVCacheGroup:
+    def __init__(self, kv_cache_spec, layer_names):
+        self.kv_cache_spec = kv_cache_spec
+        self.layer_names = layer_names
+class FakeKVCacheConfig:
+    def __init__(self, kv_cache_spec):
+        self.kv_cache_groups = [
+            FakeKVCacheGroup(
+                kv_cache_spec=kv_cache_spec,
+                layer_names=[]
+            )
+        ]
+
 def get_device_properties(device):
     return NPUDeviceProperties(device)
 
@@ -46,6 +59,8 @@ class MockRunner:
         self.attn_backends: list[type[AttentionBackend]] = []
         self.device = device
         torch.npu.set_device(device)
+        self.dtype = vllm_config.model_config.dtype
+        self.is_hybrid_chunked_prefill_graph_mode = False
         self.block_size = vllm_config.cache_config.block_size
         self.scheduler_config = vllm_config.scheduler_config
         self.model_config = vllm_config.model_config
@@ -110,7 +125,7 @@ class MockRunner:
                                          pin_memory=self.pin_memory)
         self.positions_np = self.positions_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
-                                        dtype=torch.int32,
+                                        dtype=torch.int64,
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
@@ -265,6 +280,7 @@ class MockRunner:
                     dtype=self.vllm_config.model_config.dtype,
                     use_mla=use_mla)
             logging.info(f"{layer_name=}, {self.kv_cache_spec[layer_name].type_id=}, {self.kv_cache_spec[layer_name].page_size_bytes=}")
+        self.kv_cache_config = FakeKVCacheConfig(self.kv_cache_spec)
         # get Dict[str, KVCacheSpec]
         logging.info(f"return {self.kv_cache_spec=}")
         self.get_kv_cache_groups()
@@ -364,6 +380,10 @@ class MockRunner:
             self.vllm_config.kv_transfer_config = KVTransferConfig()
         self.vllm_config.kv_transfer_config.kv_role = "kv_producer"
         scheduler_output = Mock()
+        scheduler_output.num_scheduled_tokens = {
+            req_id: num_token for req_id in self.input_batch.req_ids
+        }
+        scheduler_output.scheduled_spec_decode_tokens = set()
         scheduler_output.total_num_scheduled_tokens = num_token
         batch_reordered = self.attn_metadata_builders[0].reorder_batch(
             self.input_batch, scheduler_output)

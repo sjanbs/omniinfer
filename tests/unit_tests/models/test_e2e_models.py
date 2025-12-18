@@ -34,8 +34,12 @@ class Test_e2e_models():
 
     def _model_runner(self, local_rank: int, world_size: int, model_info, enable_graph, enable_quant, enable_speculative):
 
-        os.environ["GLOO_SOCKET_IFNAME"] = "enp23s0f3"
-        os.environ["TP_SOCKET_IFNAME"] = "enp23s0f3"
+        os.environ["GLOO_SOCKET_IFNAME"] = os.environ.get(
+            "GLOO_SOCKET_IFNAME", "enp23s0f3"
+        )
+        os.environ["TP_SOCKET_IFNAME"] = os.environ.get(
+            "TP_SOCKET_IFNAME", "enp23s0f3"
+        )
         os.environ["VLLM_USE_V1"] = "1"
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
 

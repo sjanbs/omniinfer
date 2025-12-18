@@ -19,7 +19,7 @@ def creat_vllm_config(base_config):
         hf_text_config=base_config,
         tensor_parallel_size=1,
         dtype=torch.bfloat16,
-        use_mla=True,
+        use_mla = getattr(base_config, "q_lora_rank", None) is not None,
         quant_config=None,
         max_model_len=2048,
         is_attention_free=False,
