@@ -355,7 +355,6 @@ def patch_gpu_runner_dependencies(monkeypatch):
         lambda device: dummy_props,
     )
     monkeypatch.setattr("vllm.utils.supports_dynamo", lambda: True)
-    monkeypatch.setattr("omni.adaptors.vllm.worker.npu_model_runner.decode_h2d_trigger", lambda: None)
     monkeypatch.setattr("omni.adaptors.vllm.worker.npu_model_runner.set_forward_context", lambda *_, **__: nullcontext())
     monkeypatch.setattr("omni.adaptors.vllm.worker.npu_model_runner.has_kv_transfer_group", lambda: False)
 
