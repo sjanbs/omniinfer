@@ -8,7 +8,7 @@ import port_manager
 # Configuration
 LOG_FILE_PREFIX = "server"
 APP_START_MARKER = "Application startup complete."
-STARTUP_TIMEOUT = 60  # seconds
+STARTUP_TIMEOUT = 80  # seconds
 tp=1
 dp=1
 
@@ -64,6 +64,12 @@ def setup_vllm(is_prefill, port_list):
     env["KV_CACHE_MODE"] = "1"
     env["COVERAGE_PROCESS_START"] = f"{COVRC_DIR}/.coveragerc"
     env["PYTHONPATH"] = f"{CUR_DIR}" + ":" + env.get("PYTHONPATH", "")
+
+    env["TOKENIZER_PROC_POOL"] = '1'
+    env["TOKENIZER_WORKER_NUM"] = '5'
+    env["TOKENIZER_PROC_POOL_THRES"] = '256'
+    env["TOKENIZER_AFFINITY_CORES"] = '11, 12, 13, 14, 15, 20, 21, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40'
+    
     node_type = "decode"
     if is_prefill:
         node_type = "prefill"
