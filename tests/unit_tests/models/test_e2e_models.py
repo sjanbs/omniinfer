@@ -90,20 +90,27 @@ class Test_e2e_models():
         # test forward dummy
         forward_results = self.mock_runner._dummy_run(self.vllm_config.scheduler_config.max_batch_size)
         print(f"{forward_results[0].shape=}, {forward_results[1].shape=}")
-        assert forward_results[0].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
-        assert forward_results[1].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.vocab_size])
-
+        if isinstance(forward_results, tuple):
+            assert forward_results[0].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
+            assert forward_results[1].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.vocab_size])
+        else:
+            assert forward_results.shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
         # test forward prefill
         forward_results = self.mock_runner.forward_prefill(model_info.prompt_token_ids, self.vllm_config.scheduler_config.max_batch_size)
-        assert forward_results[0].shape == torch.Size([len(model_info.prompt_token_ids), self.vllm_config.model_config.hf_config.hidden_size])
-        assert forward_results[1].shape == torch.Size([1, self.vllm_config.model_config.hf_config.vocab_size])
-
+        if isinstance(forward_results, tuple):
+            assert forward_results[0].shape == torch.Size([len(model_info.prompt_token_ids), self.vllm_config.model_config.hf_config.hidden_size])
+            assert forward_results[1].shape == torch.Size([1, self.vllm_config.model_config.hf_config.vocab_size])
+        else:
+            assert forward_results.shape == torch.Size([len(model_info.prompt_token_ids), self.vllm_config.model_config.hf_config.hidden_size])
         # test forward decode
         num_tokens = 1 # without speculative tokens
         forward_results = self.mock_runner.forward_decode(num_tokens, self.vllm_config.scheduler_config.max_batch_size)
         print(f"forward_decode: {forward_results[0].shape=}, {forward_results[1].shape=}")
-        assert forward_results[0].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
-        assert forward_results[1].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.vocab_size])
+        if isinstance(forward_results, tuple):
+            assert forward_results[0].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
+            assert forward_results[1].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.vocab_size])
+        else:
+            assert forward_results.shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
 
     @pytest.mark.parametrize("enable_speculative", [False, True])
     @pytest.mark.parametrize("enable_quant", [False, True])

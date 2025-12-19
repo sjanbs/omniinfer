@@ -19,7 +19,7 @@ def creat_vllm_config(base_config):
         hf_text_config=base_config,
         tensor_parallel_size=1,
         dtype=torch.bfloat16,
-        use_mla = getattr(base_config, "q_lora_rank", None) is not None,
+        use_mla = (getattr(base_config, "q_lora_rank", None) or getattr(base_config, "attention_q_lora_dim", None)) is not None,
         quant_config=None,
         max_model_len=2048,
         is_attention_free=False,
@@ -65,6 +65,7 @@ def creat_vllm_config(base_config):
     vllm_config.device_config = device_config
     vllm_config.speculative_config = None
     vllm_config.kv_transfer_config = None
+    vllm_config.lora_config = None
     return vllm_config
 
 @patch("vllm.config.SpeculativeConfig",
