@@ -31,9 +31,12 @@ def reload_env():
     if ret != 0:
         pytest.fail("Start proxy fail")
 
+    wait_proxy_health(proxy_port)
+
     processes = strart_vllm_mock(PREFILL_NUM, DECODE_NUM)
     if not processes:
         pytest.fail("Start vllm fail")
+    time.sleep(1)
 
     yield {
         "proxy_port": proxy_port,
@@ -42,8 +45,13 @@ def reload_env():
         "processes": processes,
     }
 
-    teardown_proxy()
     cleanup_subprocess(processes)
+
+    try:
+        teardown_proxy()
+    except Exception as e:
+        print(f"[TEARDOWN] teardown_proxy ignored: {e}")
+
 
 # Case behavior helpers
 def apply_case_1_remove(cur_prefill, cur_decode):
@@ -94,53 +102,88 @@ def reload_nginx(conf_path):
 def wait_proxy_health(proxy_port, timeout=30):
     url = f"http://127.0.0.1:{proxy_port}/omni_proxy/health"
     start = time.time()
+
+    last_err = None
+
     while time.time() - start < timeout:
         try:
-            r = requests.get(url, timeout=3)
+            r = requests.get(url, timeout=2)
+
             if r.status_code == 200:
                 return
-        except Exception:
-            pass
-        time.sleep(1)
-    pytest.fail("proxy health endpoint not ready after reload")
 
-# 整体替换 upstream（不是增量 patch）
-def rewrite_upstream(conf_path, prefill_ports, decode_ports):
+            last_err = f"HTTP {r.status_code}"
+
+        except requests.exceptions.ConnectionError as e:
+            last_err = f"conn refused: {e}"
+
+        except Exception as e:
+            last_err = str(e)
+
+        time.sleep(0.5)
+
+    pytest.fail(
+        f"proxy health endpoint not ready after reload, last error={last_err}"
+    )
+
+
+# 整体替换 upstream（只替换server行）
+def rewrite_upstream_servers_only(conf_path, upstream_name, new_ports):
     with open(conf_path, "r") as f:
         lines = f.readlines()
 
-    def gen_block(name, ports):
-        out = [
-            f"    upstream {name} {{\n",
-            "        keepalive 2048;\n",
-            "        keepalive_timeout 110s;\n",
-            "        keepalive_requests 20000;\n",
-        ]
-        for p in ports:
-            out.append(
-                f"        server 127.0.0.1:{p} max_fails=3 fail_timeout=10s;\n"
-            )
-        out.append("    }\n")
-        return out
-
     new_lines = []
     i = 0
+    inside_target = False
+    brace_depth = 0
+    server_inserted = False
+
     while i < len(lines):
         line = lines[i]
-        if line.strip().startswith("upstream prefill_endpoints"):
-            new_lines.extend(gen_block("prefill_endpoints", prefill_ports))
-            while not lines[i].strip().endswith("}"):
-                i += 1
-        elif line.strip().startswith("upstream decode_endpoints"):
-            new_lines.extend(gen_block("decode_endpoints", decode_ports))
-            while not lines[i].strip().endswith("}"):
-                i += 1
-        else:
+
+        if line.strip().startswith(f"upstream {upstream_name}"):
+            inside_target = True
+            brace_depth = 0
+            server_inserted = False
             new_lines.append(line)
+            i += 1
+            continue
+
+        if inside_target:
+            # Track brace depth to know when upstream ends
+            brace_depth += line.count("{")
+            brace_depth -= line.count("}")
+
+            stripped = line.strip()
+
+            # Skip all existing server lines
+            if stripped.startswith("server "):
+                i += 1
+                continue
+
+            # Before closing brace, inject new server lines (only once)
+            if stripped == "}" and not server_inserted:
+                for p in new_ports:
+                    new_lines.append(
+                        f"        server 127.0.0.1:{p} max_fails=3 fail_timeout=10s;\n"
+                    )
+                server_inserted = True
+                new_lines.append(line)
+                inside_target = False
+                i += 1
+                continue
+
+            # Keep all non-server lines untouched
+            new_lines.append(line)
+            i += 1
+            continue
+
+        new_lines.append(line)
         i += 1
 
     with open(conf_path, "w") as f:
         f.writelines(new_lines)
+
 
 # 等 vLLM mock 新实例启动完成（Case 3 用）
 def wait_vllm_ready(processes, logs, timeout=60):
@@ -171,11 +214,24 @@ def wait_vllm_ready(processes, logs, timeout=60):
 
     raise RuntimeError("new vLLM instances did not become ready in time")
 
+COMPLETE_MARK = "Upstream initialization completed"
+def wait_reload_complete_from_log(error_log: Path, start_pos: int, timeout=30):
+    start = time.time()
+    while time.time() - start < timeout:
+        if error_log.exists():
+            with open(error_log, "r") as f:
+                f.seek(start_pos)
+                logs = f.read()
+            if COMPLETE_MARK in logs:
+                return
+        time.sleep(0.5)
+    pytest.fail("reload did not complete")
 
 def test_proxy_reload(reload_env):
     proxy_port = reload_env["proxy_port"]
     prefill_port_list = reload_env["prefill_ports"]
     decode_port_list = reload_env["decode_ports"]
+
     """
     Health-based proxy reload test (enhanced).
 
@@ -193,15 +249,6 @@ def test_proxy_reload(reload_env):
         * master PID unchanged
     - nginx.conf must be restored after test
     """
-    # =========================================================
-    # [方案B新增] 通过环境变量选择只跑某一个 Case
-    #
-    # 未设置 RELOAD_CASE：
-    #   pytest -s test_proxy_reload.py  -> 跑 Case 1~4（原始行为）
-    #
-    # 设置 RELOAD_CASE=1/2/3/4：
-    #   只执行指定的 Case（Case 2/4 会做静默前置准备，以保证语义成立）
-    # =========================================================
     SELECT_CASE = os.getenv("RELOAD_CASE")
     if SELECT_CASE:
         print(f"[RELOAD_CASE] Only running Case {SELECT_CASE}")
@@ -221,8 +268,6 @@ def test_proxy_reload(reload_env):
     # 备份 nginx.conf（必须保证最终恢复）
     with open(conf_path, "r") as f:
         original_nginx_conf = f.read()
-
-    # Helpers
 
     # 获取 nginx master / worker PID
     def get_nginx_pids(tag=""):
@@ -260,7 +305,7 @@ def test_proxy_reload(reload_env):
                 f"{new_logs}"
             )
 
-    # reload 过程中验证 proxy 不 502、不掉请求
+    # reload 后的同步功能性验证（非并发）
     def send_requests(num=30):
         url = f"http://127.0.0.1:{proxy_port}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -271,36 +316,55 @@ def test_proxy_reload(reload_env):
             "messages": [{"role": "user", "content": "hi"}],
             "stream": False,
         }
+
         for i in range(num):
             r = requests.post(url, headers=headers, json=data, timeout=15)
             if r.status_code != 200:
                 pytest.fail(
                     f"Request {i} failed: HTTP {r.status_code}, body={r.text!r}"
                 )
-            # reload 过程中允许空 body / 非 JSON
+
+            body = (r.text or "").strip()
+            if not body:
+                pytest.fail(f"Request {i} returned empty body")
+
+            parsed = False
+
+            # 情况 1：普通 JSON
             try:
                 r.json()
+                parsed = True
             except Exception:
                 pass
+
+            # 情况 2：SSE（data: {...}）
+            if not parsed:
+                for line in body.splitlines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+
+                    data_part = line[len("data:"):].strip()
+                    if not data_part or data_part == "[DONE]":
+                        continue
+
+                    try:
+                        json.loads(data_part)
+                        parsed = True
+                        break
+                    except Exception:
+                        continue
+
+            if not parsed:
+                pytest.fail(
+                    f"Request {i} returned non-JSON body (not JSON, not SSE JSON): "
+                    f"{body[:200]!r}"
+                )
 
     # Log helpers（识别 reload 完成、识别新增端口注册）
     PREFILL_RE = re.compile(r"Add Prefill peer .* -> 127\.0\.0\.1:(\d+)")
     DECODE_RE  = re.compile(r"Add Decode peer .* -> 127\.0\.0\.1:(\d+)")
-    COMPLETE_MARK = "Upstream initialization completed"
 
-    def wait_reload_complete_from_log(error_log, start_pos, timeout=30):
-        start = time.time()
-        while time.time() - start < timeout:
-            if error_log.exists():
-                with open(error_log, "r") as f:
-                    f.seek(start_pos)
-                    logs = f.read()
-                if COMPLETE_MARK in logs:
-                    return
-            time.sleep(0.5)
-        pytest.fail("reload did not complete (no completion mark in log)")
-
-    # 解析新增日志里出现过的新端口
     def parse_new_ports_from_log(error_log, start_pos):
         if not error_log.exists():
             return set(), set()
@@ -312,7 +376,9 @@ def test_proxy_reload(reload_env):
             set(int(p) for p in DECODE_RE.findall(logs)),
         )
 
+    # =========================================================
     # Test body（必须保证：异常也能清理 & 还原）
+    # =========================================================
     try:
         # Prepare baseline ports
         base_prefill = prefill_port_list.copy()
@@ -324,7 +390,6 @@ def test_proxy_reload(reload_env):
         new_processes = []
         new_logs = []
 
-        # Reload cases runner（最终稳定语义）
         def run_case(
             case_name,
             modify_fn,
@@ -346,36 +411,37 @@ def test_proxy_reload(reload_env):
 
             # 修改配置 + reload
             modify_fn()
-            rewrite_upstream(conf_path, cur_prefill, cur_decode)
+
+            rewrite_upstream_servers_only(
+                conf_path,
+                "prefill_endpoints",
+                cur_prefill,
+            )
+            rewrite_upstream_servers_only(
+                conf_path,
+                "decode_endpoints",
+                cur_decode,
+            )
 
             after_prefill_cfg = cur_prefill.copy()
             after_decode_cfg  = cur_decode.copy()
 
             reload_nginx(conf_path)
-            wait_proxy_health(proxy_port)
             wait_reload_complete_from_log(error_log, log_pos)
+            time.sleep(0.5)
+            wait_proxy_health(proxy_port)
 
             # reload 后：PID 校验
             master_after, workers_after = get_nginx_pids("after reload")
 
-            # 是否严格要求 master PID 不变
-            STRICT_MASTER_CHECK = os.getenv("STRICT_MASTER_CHECK", "0") == "1"
-
-            if STRICT_MASTER_CHECK:
-                assert master_after == master_before, (
-                    f"nginx master pid changed: {master_before} -> {master_after}"
-                )
-            else:
-                if master_after != master_before:
-                    print(
-                        f"[INFO] nginx master pid changed (allowed): "
-                        f"{master_before} -> {master_after}"
-                    )
+            # master PID 必须不变（硬性要求）
+            assert master_after == master_before, (
+                f"nginx master pid changed: {master_before} -> {master_after}"
+            )
 
             # worker 必须轮换（这个断言必须保留）
             assert workers_after != workers_before, \
                 "nginx workers not rotated after reload"
-
 
             # 打印：配置层 upstream 对比表（只做可视化）
             def _fmt(ports):
@@ -418,7 +484,17 @@ def test_proxy_reload(reload_env):
             assert_no_nginx_crash(error_log, log_pos)
 
         def _silent_apply_state(prefill_ports, decode_ports):
-            rewrite_upstream(conf_path, prefill_ports, decode_ports)
+            # 静默准备也必须使用 rewrite_upstream_servers_only（保持你优化后的实现）
+            rewrite_upstream_servers_only(
+                conf_path,
+                "prefill_endpoints",
+                prefill_ports,
+            )
+            rewrite_upstream_servers_only(
+                conf_path,
+                "decode_endpoints",
+                decode_ports,
+            )
             reload_nginx(conf_path)
             wait_proxy_health(proxy_port)
 
@@ -439,7 +515,6 @@ def test_proxy_reload(reload_env):
             _silent_apply_state(cur_prefill, cur_decode)
 
         # 单 Case: 如果只跑 Case 4，需要先静默进入“Case3 状态”
-        # 也就是：起新 vLLM + upstream 加新端口 + reload 生效（静默）
         p3_port = None
         d3_port = None
         if SELECT_CASE == "4":
@@ -505,15 +580,12 @@ def test_proxy_reload(reload_env):
                     expect_new_d=[d3_port],
                 )
             finally:
-                # Case 3 新起的 vLLM 必须清理
                 cleanup_subprocess(new_processes)
                 new_processes = []
                 new_logs = []
 
         # Case 4: -P3 / -D3（必须回到 base）
         if SELECT_CASE in (None, "4"):
-            # 若是全量跑：p3_port/d3_port 来自 Case3
-            # 若是单跑 Case4：p3_port/d3_port 在上面的静默准备里生成
             run_case(
                 "Case 4: -P3 / -D3",
                 lambda: apply_case_4_remove_new(cur_prefill, cur_decode, p3_port, d3_port),
@@ -529,7 +601,6 @@ def test_proxy_reload(reload_env):
         # 防御性清理：单 Case 4 静默准备时可能起了 vLLM
         if 'new_processes' in locals() and new_processes:
             cleanup_subprocess(new_processes)
-
 
 
 def test_proxy_reload_under_concurrent_traffic(reload_env):
@@ -561,10 +632,10 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
     base_decode  = reload_env["decode_ports"].copy()
 
     conf_path = "/usr/local/nginx/conf/nginx.conf"
-
-    # ============================
-    # 线程控制 & 错误收集
-    # ============================
+    error_log = Path(
+        "/data/l00959921/omniinfer/tests/unit_tests/accelerators/nginx_error.log"
+    )
+    log_pos = error_log.stat().st_size if error_log.exists() else 0
 
     # 用于通知请求线程停止
     stop_event = threading.Event()
@@ -575,21 +646,44 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
     # reload 线程中捕获的异常（线程异常不能直接抛给 pytest）
     reload_errors = []
 
-    # ============================
-    # 请求侧统计信息（仅用于观测，不影响 pass / fail）
-    # ============================
-
-    # 请求总数
-    request_count = 0
-
-    # 成功（HTTP 200）的请求数
-    request_success = 0
+    stats = {
+        # 请求总数
+        "request_count": 0,
+        # 成功（HTTP 200 且满足 body/JSON 校验）的请求数
+        "request_success": 0,
+    }
 
     # 每个请求的耗时（秒）
     request_latencies = []
 
     # 保护统计变量的线程锁
     stats_lock = threading.Lock()
+
+    # nginx PID helpers（打印 master/workers）
+    def get_nginx_pids(tag=""):
+        out = subprocess.check_output(
+            "ps -ef | grep nginx | grep -v grep",
+            shell=True
+        ).decode()
+
+        master = None
+        workers = []
+
+        for line in out.splitlines():
+            parts = line.split()
+            if "master process" in line:
+                master = int(parts[1])
+            elif "worker process" in line:
+                workers.append(int(parts[1]))
+
+        print(f"\n[NGINX PID] {tag}")
+        print(f"  master : {master}")
+        print(f"  workers: {workers}")
+
+        return master, workers
+
+    # master pid 全程不变的基线（从测试开始就锁死）
+    master_pid_baseline, _ = get_nginx_pids("baseline (test start)")
 
     # =========================================================
     # 前台请求线程：模拟真实业务流量（数据面）
@@ -603,8 +697,6 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
         - reload 期间请求不能失败
         - 记录请求耗时，用于最终统计
         """
-        nonlocal request_count, request_success
-
         url = f"http://127.0.0.1:{proxy_port}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         data = {
@@ -629,7 +721,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
 
                 # 更新请求统计
                 with stats_lock:
-                    request_count += 1
+                    stats["request_count"] += 1
                     request_latencies.append(latency)
 
                 # 非 200 直接记为错误
@@ -639,28 +731,63 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
                     )
                     continue
 
-                # 成功请求计数
-                with stats_lock:
-                    request_success += 1
+                # 不允许空 body
+                body = (r.text or "").strip()
+                if not body:
+                    request_errors.append("empty body")
+                    continue
 
-                # reload 期间允许返回空 body 或非 JSON（边界行为）
+                # 不允许非 JSON（但允许 SSE data: {...}）
+                parsed = False
+
+                # 情况 1：普通 JSON
                 try:
                     r.json()
+                    parsed = True
                 except Exception:
                     pass
+
+                # 情况 2：SSE（data: {...}）
+                if not parsed:
+                    for line in body.splitlines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+
+                        data_part = line[len("data:"):].strip()
+                        if not data_part or data_part == "[DONE]":
+                            continue
+
+                        try:
+                            json.loads(data_part)
+                            parsed = True
+                            break
+                        except Exception:
+                            continue
+
+                if not parsed:
+                    request_errors.append(
+                        f"non-JSON body: {body[:200]!r}"
+                    )
+                    continue
+
+                # 成功请求计数（必须在严格校验通过后）
+                with stats_lock:
+                    stats["request_success"] += 1
 
             except Exception as e:
                 # 所有异常（包括 timeout）都视为失败
                 latency = time.time() - start_ts
                 with stats_lock:
-                    request_count += 1
+                    stats["request_count"] += 1
                     request_latencies.append(latency)
 
                 request_errors.append(str(e))
+            
+            finally:
+                time.sleep(0.02)
 
-    # =========================================================
     # 后台 reload 线程：控制面（真实配置 churn）
-    # =========================================================
     def reload_worker():
         """
         后台执行多轮 reload，每一轮严格按照 Case 1~4 顺序执行。
@@ -695,29 +822,117 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
                 # Case 1：删除一个 P / D
                 # -----------------------------
                 print(f"[ROUND {round_id}] Case 1: remove one P and one D")
+
+                master_before, workers_before = get_nginx_pids(
+                    f"round {round_id} case 1 (before reload)"
+                )
+                if master_before != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 1] master pid already changed before reload: "
+                        f"{master_pid_baseline} -> {master_before}"
+                    )
+
                 removed_p, removed_d = apply_case_1_remove(cur_prefill, cur_decode)
                 print(f"[ROUND {round_id}]   removed P={removed_p}, D={removed_d}")
 
-                rewrite_upstream(conf_path, cur_prefill, cur_decode)
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "prefill_endpoints",
+                    cur_prefill,
+                )
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "decode_endpoints",
+                    cur_decode,
+                )
+                time.sleep(1.0)
                 reload_nginx(conf_path)
+                wait_reload_complete_from_log(error_log, log_pos)
+                time.sleep(0.5)
                 wait_proxy_health(proxy_port)
-                time.sleep(random.uniform(0.5, 1.5))
+
+
+                master_after, workers_after = get_nginx_pids(
+                    f"round {round_id} case 1 (after reload)"
+                )
+
+                # master PID 全程不变（硬性要求）
+                if master_after != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 1] nginx master pid changed: "
+                        f"{master_pid_baseline} -> {master_after}"
+                    )
+
+                # worker 必须轮换（与单用例一致）
+                if workers_after == workers_before:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 1] nginx workers not rotated after reload"
+                    )
+
+                time.sleep(random.uniform(3, 8))
 
                 # -----------------------------
                 # Case 2：恢复到 baseline
                 # -----------------------------
                 print(f"[ROUND {round_id}] Case 2: restore base P/D")
+
+                master_before, workers_before = get_nginx_pids(
+                    f"round {round_id} case 2 (before reload)"
+                )
+                if master_before != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 2] master pid changed before reload: "
+                        f"{master_pid_baseline} -> {master_before}"
+                    )
+
                 apply_case_2_restore(cur_prefill, cur_decode, base_prefill, base_decode)
 
-                rewrite_upstream(conf_path, cur_prefill, cur_decode)
-                reload_nginx(conf_path)
-                wait_proxy_health(proxy_port)
-                time.sleep(random.uniform(0.5, 1.5))
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "prefill_endpoints",
+                    cur_prefill,
+                )
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "decode_endpoints",
+                    cur_decode,
+                )
 
-                # -----------------------------
-                # Case 3：新增 P / D（真实新 vLLM）
-                # -----------------------------
+                time.sleep(1.0)
+                reload_nginx(conf_path)
+                wait_reload_complete_from_log(error_log, log_pos)
+                time.sleep(0.5)
+                wait_proxy_health(proxy_port)
+
+
+                master_after, workers_after = get_nginx_pids(
+                    f"round {round_id} case 2 (after reload)"
+                )
+
+                if master_after != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 2] nginx master pid changed: "
+                        f"{master_pid_baseline} -> {master_after}"
+                    )
+
+                if workers_after == workers_before:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 2] nginx workers not rotated after reload"
+                    )
+
+                time.sleep(random.uniform(3, 8))
+
+                # Case 3：新增 P / D（新 vLLM）
                 print(f"[ROUND {round_id}] Case 3: add new P/D backends")
+
+                master_before, workers_before = get_nginx_pids(
+                    f"round {round_id} case 3 (before reload)"
+                )
+                if master_before != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 3] master pid changed before reload: "
+                        f"{master_pid_baseline} -> {master_before}"
+                    )
 
                 p3 = port_manager.find_free_port_excluding_existing()
                 d3 = port_manager.find_free_port_excluding_existing()
@@ -737,26 +952,89 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
 
                 apply_case_3_append_existing(cur_prefill, cur_decode, p3, d3)
 
-                rewrite_upstream(conf_path, cur_prefill, cur_decode)
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "prefill_endpoints",
+                    cur_prefill,
+                )
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "decode_endpoints",
+                    cur_decode,
+                )
+                time.sleep(1.0)
                 reload_nginx(conf_path)
+                wait_reload_complete_from_log(error_log, log_pos)
+                time.sleep(0.5)
                 wait_proxy_health(proxy_port)
-                time.sleep(random.uniform(1, 2))
 
-                # -----------------------------
+
+                master_after, workers_after = get_nginx_pids(
+                    f"round {round_id} case 3 (after reload)"
+                )
+
+                if master_after != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 3] nginx master pid changed: "
+                        f"{master_pid_baseline} -> {master_after}"
+                    )
+
+                if workers_after == workers_before:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 3] nginx workers not rotated after reload"
+                    )
+
+                time.sleep(random.uniform(3, 8))
+
                 # Case 4：移除新增节点，回滚
-                # -----------------------------
                 print(f"[ROUND {round_id}] Case 4: remove new P/D and rollback")
 
+                master_before, workers_before = get_nginx_pids(
+                    f"round {round_id} case 4 (before reload)"
+                )
+                if master_before != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 4] master pid changed before reload: "
+                        f"{master_pid_baseline} -> {master_before}"
+                    )
+                time.sleep(1.0)
                 apply_case_4_remove_new(cur_prefill, cur_decode, p3, d3)
 
-                rewrite_upstream(conf_path, cur_prefill, cur_decode)
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "prefill_endpoints",
+                    cur_prefill,
+                )
+                rewrite_upstream_servers_only(
+                    conf_path,
+                    "decode_endpoints",
+                    cur_decode,
+                )
+                time.sleep(1.0)
                 reload_nginx(conf_path)
+                wait_reload_complete_from_log(error_log, log_pos)
+                time.sleep(0.5)
                 wait_proxy_health(proxy_port)
-                time.sleep(random.uniform(0.5, 1.5))
 
-                # -----------------------------
+
+                master_after, workers_after = get_nginx_pids(
+                    f"round {round_id} case 4 (after reload)"
+                )
+
+                if master_after != master_pid_baseline:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 4] nginx master pid changed: "
+                        f"{master_pid_baseline} -> {master_after}"
+                    )
+
+                if workers_after == workers_before:
+                    raise RuntimeError(
+                        f"[Round {round_id} Case 4] nginx workers not rotated after reload"
+                    )
+
+                time.sleep(random.uniform(3, 8))
+
                 # 防污染校验（必须回到 baseline）
-                # -----------------------------
                 if set(cur_prefill) != set(base_prefill):
                     raise RuntimeError(
                         f"[Round {round_id}] Prefill polluted: "
@@ -778,9 +1056,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
             # 确保所有新起的 vLLM 被清理
             cleanup_subprocess(new_processes)
 
-    # =========================================================
     # 启动并发执行
-    # =========================================================
     t_req = threading.Thread(target=request_worker, daemon=True)
     t_reload = threading.Thread(target=reload_worker)
 
@@ -792,9 +1068,14 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
     stop_event.set()
     t_req.join(timeout=10)
 
-    # =========================================================
     # 最终断言 & 汇总输出
-    # =========================================================
+    # 测试结束再确认一次 master pid 仍不变（从头到尾不能变）
+    master_end, _ = get_nginx_pids("baseline check (test end)")
+    if master_end != master_pid_baseline:
+        pytest.fail(
+            f"nginx master pid changed during test: {master_pid_baseline} -> {master_end}"
+        )
+
     if reload_errors:
         pytest.fail(f"Reload thread failed: {reload_errors[0]}")
 
@@ -809,9 +1090,10 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
         max_lat = max(request_latencies)
         avg_lat = sum(request_latencies) / len(request_latencies)
         print(
-            f"\n[REQUEST] total={request_count} "
-            f"success={request_success} "
+            f"\n[REQUEST] total={stats['request_count']} "
+            f"success={stats['request_success']} "
             f"max_latency={max_lat:.2f}s "
             f"avg_latency={avg_lat:.2f}s"
         )
+
 
