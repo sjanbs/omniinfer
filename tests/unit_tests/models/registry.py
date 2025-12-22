@@ -72,6 +72,7 @@ config_DeepseekV3ForCausalLM = PretrainedConfig(
                         "original_max_position_embeddings": 4096,
                         "type": "yarn"
                     },
+        decode_cost_time=0.0015,
         quantization_config=None # overwritten when enable_quant=True
     )
 
@@ -122,6 +123,7 @@ config_DeepseekV31ForCausalLM = PretrainedConfig(
     bos_token_id=0,
     eos_token_id=1,
     model_type="deepseek_v3",
+    decode_cost_time=0.0015,
     quantization_config=None,  # overwritten when enable_quant=True
 )
 
@@ -172,6 +174,7 @@ config_DeepseekV32ForCausalLM = PretrainedConfig(
     num_nextn_predict_layers=1,
     use_cache=True,
     torch_dtype=torch.bfloat16,
+    decode_cost_time=0.0015,
     quantization_config=None
 )
 
@@ -199,6 +202,7 @@ config_PanguEmbeddedForCausalLM = PretrainedConfig(
     tie_word_embeddings=False,
     use_cache=True,
     torch_dtype=torch.bfloat16,
+    decode_cost_time=0.0016,
     quantization_config=None,
 )
 
@@ -238,6 +242,7 @@ config_PanguProMoEV2ForCausalLM = PretrainedConfig(
     use_cache=True,
     torch_dtype=torch.bfloat16,
     vocab_size=10000,
+    decode_cost_time=0.0017,
     quantization_config=None
 )
 config_PanguUltraMoEForCausalLM = PretrainedConfig(
@@ -271,6 +276,7 @@ config_PanguUltraMoEForCausalLM = PretrainedConfig(
     tie_word_embeddings=False,
     use_cache=True,
     torch_dtype=torch.bfloat16,
+    decode_cost_time=0.00155,
     quantization_config=None,
 )
 
