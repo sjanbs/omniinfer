@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 from collections import Counter
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Union
+from statistics import fmean, stdev
+from typing import Any, Dict, Optional, Union, Iterable, List, Sequence
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -104,3 +105,22 @@ def load_configs(
         return None
 
     return config_data[required_key]
+
+def three_sigma_filter(
+    values: List[float], sigma: float = 3.0) -> float:
+
+    if sigma <= 0:
+        raise ValueError("sigma must be positive")
+
+    mean_value = fmean(values)
+    deviation = stdev(values)
+
+    lower_bound = mean_value - sigma * deviation
+    upper_bound = mean_value + sigma * deviation
+    updated_values = [
+        value for value in values if lower_bound <= value <= upper_bound
+    ]
+
+    filtered_values = fmean(updated_values)
+
+    return filtered_values
