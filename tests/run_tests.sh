@@ -46,6 +46,7 @@ TARGET_DIR="${SCRIPT_DIR}/unit_tests/accelerators/mock_model"
 if [[ -n "${CONFIG_PATH}" ]]; then
     mkdir -p "${TARGET_DIR}"
     cp "${CONFIG_PATH}"/*.json "${TARGET_DIR}/"
+    cp "${CONFIG_PATH}"/*.txt "${TARGET_DIR}/"
 else
     bash "${SCRIPT_DIR}/download_config.sh"
 fi
