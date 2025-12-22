@@ -3,6 +3,7 @@ import pytest
 import os
 import gc
 import torch
+import time
 import torch.multiprocessing as mp
 import tempfile
 from unittest.mock import patch
@@ -17,7 +18,7 @@ from vllm.config import set_current_vllm_config
 from omni.models.config_loader.loader import model_extra_config
 from omni.quantization.compressed_tensors.compressed_tensors import AscendCompressedTensorsConfig
 from .base import MockRunner
-from .utils import creat_vllm_config, load_configs, get_speculative_config
+from .utils import creat_vllm_config, load_configs, get_speculative_config, three_sigma_filter
 from .registry import HF_EXAMPLE_MODELS
 
 class Test_e2e_models():
@@ -31,6 +32,18 @@ class Test_e2e_models():
                 backend="hccl",
             )
             initialize_model_parallel(world_size, 1)
+
+    def _latency_test(self, num_tokens, model_type, threshold, test_count=100, redundancy=5):
+        res = []
+        for idx in range(test_count + redundancy):
+            start_t = time.time()
+            _ = self.mock_runner.forward_decode(num_tokens, self.vllm_config.scheduler_config.max_batch_size)
+            end_t = time.time()
+            if idx >= redundancy:
+                res.append(end_t - start_t)
+        filtered_times = three_sigma_filter(res)
+        assert filtered_times <= float(threshold) * 1.05, f"Model:{model_type} the inference latency \
+            {filtered_times} exceeds threshold {float(threshold) *1.05}"
 
     def _model_runner(self, local_rank: int, world_size: int, model_info, enable_graph, enable_quant, enable_speculative):
 
@@ -111,6 +124,11 @@ class Test_e2e_models():
             assert forward_results[1].shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.vocab_size])
         else:
             assert forward_results.shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
+
+        if enable_graph and enable_quant and enable_speculative:
+            self._latency_test(num_tokens=num_tokens, 
+                               model_type=self.vllm_config.model_config.hf_config.model_type, 
+                               threshold=self.vllm_config.model_config.hf_config.decode_cost_time)
 
     @pytest.mark.parametrize("enable_speculative", [False, True])
     @pytest.mark.parametrize("enable_quant", [False, True])
