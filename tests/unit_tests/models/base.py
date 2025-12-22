@@ -488,7 +488,6 @@ class MockRunner:
         # reuse the req created in forward_prefill
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
-        print(f"forward_decode {num_token=}")
 
         req_index = self.input_batch.req_id_to_index.get(self.req_id)
         self.input_batch.num_computed_tokens_cpu[req_index] = (self.input_batch.num_prompt_tokens[req_index])
@@ -544,7 +543,6 @@ class MockRunner:
 
         graph_pad_size = 0
         graph_pad_size = self.max_batch_size - num_token
-        print(f"forward_decode {self.max_batch_size=}, {graph_pad_size=}")
         if graph_pad_size >= 0:
             if self.uses_mrope:
                 padding_positions = torch.zeros(positions.size(0), graph_pad_size, dtype=positions.dtype, device=positions.device)
