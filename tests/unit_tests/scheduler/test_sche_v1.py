@@ -22,9 +22,18 @@ import huggingface_hub
 
 _CACHED_NO_EXIST_T = Any
 EOS_TOKEN_ID = 50256
+ENV_MOCK_FILE_PATH: str = "/"
 
+# initialize the model path
+def get_model_mock_file_path():
+    work_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(work_dir)
+    redirect_target_dir = os.path.join(parent_dir, "accelerators", "mock_model")
+    global ENV_MOCK_FILE_PATH
+    ENV_MOCK_FILE_PATH = redirect_target_dir
+    return ENV_MOCK_FILE_PATH
 
-# facebook/opt-125m
+# origin model mock: facebook/opt-125m
 
 def mock_try_to_load_from_cache(
         repo_id: str,
@@ -46,7 +55,7 @@ mock_func = global_patch.start()
 
 # model path set by setup_vllm_mock.sh
 def create_scheduler(
-        model: str = "/workspace/omniinfer/tests/unit_tests/accelerators/mock_model",
+        model: str = get_model_mock_file_path(),
         max_num_seqs: int = 16,
         max_num_batched_tokens: int = 8192,
         enable_prefix_caching: Optional[bool] = None,
@@ -155,7 +164,7 @@ def mock_create_connector_v1(
 
 
 def create_kv_manager_scheduler(
-        model: str = "/workspace/omniinfer/tests/unit_tests/accelerators/mock_model",
+        model: str = get_model_mock_file_path(),
         max_num_seqs: int = 16,
         max_num_batched_tokens: int = 8192,
         enable_prefix_caching: Optional[bool] = None,
