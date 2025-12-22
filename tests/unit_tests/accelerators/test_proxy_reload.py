@@ -254,9 +254,7 @@ def test_proxy_reload(reload_env):
         print(f"[RELOAD_CASE] Only running Case {SELECT_CASE}")
 
     conf_path = "/usr/local/nginx/conf/nginx.conf"
-    error_log = Path(
-        "/data/l00959921/omniinfer/tests/unit_tests/accelerators/nginx_error.log"
-    )
+    error_log = Path.cwd() / "nginx_error.log"
 
     # nginx crash 关键字
     NGINX_CRASH_KEYWORDS = [
@@ -632,9 +630,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
     base_decode  = reload_env["decode_ports"].copy()
 
     conf_path = "/usr/local/nginx/conf/nginx.conf"
-    error_log = Path(
-        "/data/l00959921/omniinfer/tests/unit_tests/accelerators/nginx_error.log"
-    )
+    error_log = Path.cwd() / "nginx_error.log"
     log_pos = error_log.stat().st_size if error_log.exists() else 0
 
     # 用于通知请求线程停止
