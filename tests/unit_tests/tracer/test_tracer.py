@@ -1,6 +1,5 @@
 from omni.tools.profiler.trace.tracing import (
     init_tracer,
-    get_local_ip,
     create_span,
     clean_ctx,
     parent_ctx_var,
@@ -17,7 +16,7 @@ import time
 def test_tracer_task():
     pass
     init_tracer()
-    ip = get_local_ip()
+    ip = "127.0.0.1"
     dot_group = ip.split(".")
     assert len(dot_group) == 4
     time_stamp_1 = time.time()
