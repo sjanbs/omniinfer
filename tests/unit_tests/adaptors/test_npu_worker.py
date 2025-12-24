@@ -12,10 +12,23 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 
-from omni.adaptors.vllm.worker.npu_worker import *  # noqa
+# NOTE: Do not import npu_worker at module import time; import lazily in helpers/tests to avoid
+# import-time side effects during pytest collection and to minimize cross-test interference.
 
 
 MODULE = "omni.adaptors.vllm.worker.npu_worker"
+
+_MISSING = object()
+
+def _get_npu_worker_module():
+    """Lazy import to avoid import-time side effects during pytest collection."""
+    return importlib.import_module(MODULE)
+
+_ISOLATED_SYS_MODULE_KEYS = (
+    "omni.adaptors.vllm.token_recovery.ha_server",
+    "omni.adaptors.vllm.npu_mem_pool",
+)
+
 
 
 def _sn(**kwargs):
@@ -71,9 +84,31 @@ class _ModelRunnerOutput:
 class TestNPUWorker(unittest.TestCase):
     def setUp(self):
         super().setUp()
+        # Snapshot global state that can easily leak across tests.
+        self._environ_snapshot = os.environ.copy()
+        self._cuda_get_dev_props_snapshot = getattr(getattr(torch, "cuda", None), "get_device_properties", _MISSING)
+        self._sys_modules_snapshot = {k: sys.modules.get(k, _MISSING) for k in _ISOLATED_SYS_MODULE_KEYS}
 
     def tearDown(self):
-        super().tearDown()
+        # Restore global state to avoid polluting other test modules.
+        try:
+            os.environ.clear()
+            os.environ.update(self._environ_snapshot)
+
+            for k, v in self._sys_modules_snapshot.items():
+                if v is _MISSING:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+            if self._cuda_get_dev_props_snapshot is not _MISSING:
+                try:
+                    torch.cuda.get_device_properties = self._cuda_get_dev_props_snapshot
+                except Exception:
+                    # Some torch builds may not allow assignment here; ignore defensively.
+                    pass
+        finally:
+            super().tearDown()
 
     # ---------------- helpers ----------------
 
@@ -122,6 +157,7 @@ class TestNPUWorker(unittest.TestCase):
         if vllm_config is None:
             vllm_config = self._make_vllm_config()
 
+        NPUWorker = _get_npu_worker_module().NPUWorker
         w = NPUWorker.__new__(NPUWorker)
         w.vllm_config = vllm_config
         w.model_config = vllm_config.model_config
@@ -154,6 +190,8 @@ class TestNPUWorker(unittest.TestCase):
     # ---------------- tests ----------------
 
     def test_npuworker_init_sets_cache_dtype_auto_or_explicit(self):
+        NPUWorker = _get_npu_worker_module().NPUWorker
+
         def fake_workerbase_init(
             self,
             vllm_config,
@@ -173,34 +211,30 @@ class TestNPUWorker(unittest.TestCase):
             self.rank = rank
             self.distributed_init_method = distributed_init_method
             self.is_driver_worker = is_driver_worker
-        old_get_dev_props = getattr(torch.cuda, "get_device_properties", None)
-        try:
-            with patch(f"{MODULE}.WorkerBase.__init__", new=fake_workerbase_init), \
-                 patch(
-                 f"{MODULE}.envs",
-                 _sn(
-                     VLLM_LOGGING_CONFIG_PATH=None,
-                     VLLM_USE_RAY_SPMD_WORKER=False,
-                     VLLM_ENABLE_V1_MULTIPROCESSING=False,
-                     VLLM_TORCH_PROFILER_DIR=None,
-                 ),
-             ),  \
-                 patch.object(NPUWorker, "_init_graph_options", lambda self: setattr(self, "enable_torchair_graph_mode", False)), \
-                 patch(f"{MODULE}.get_device_properties", Mock()), \
-                 patch(f"{MODULE}.STR_DTYPE_TO_TORCH_DTYPE", {"float16": torch.float16, "bfloat16": torch.bfloat16}):
+        with patch(f"{MODULE}.WorkerBase.__init__", new=fake_workerbase_init), \
+             patch(
+             f"{MODULE}.envs",
+             _sn(
+                 VLLM_LOGGING_CONFIG_PATH=None,
+                 VLLM_USE_RAY_SPMD_WORKER=False,
+                 VLLM_ENABLE_V1_MULTIPROCESSING=False,
+                 VLLM_TORCH_PROFILER_DIR=None,
+             ),
+         ),  \
+             patch.object(NPUWorker, "_init_graph_options", lambda self: setattr(self, "enable_torchair_graph_mode", False)), \
+             patch(f"{MODULE}.get_device_properties", Mock()), \
+             patch(f"{MODULE}.STR_DTYPE_TO_TORCH_DTYPE", {"float16": torch.float16, "bfloat16": torch.bfloat16}):
 
-                cfg = self._make_vllm_config(cache_dtype="auto", model_dtype=torch.bfloat16)
-                w = NPUWorker(cfg, local_rank=0, rank=0, distributed_init_method="tcp://x")
-                self.assertEqual(w.cache_dtype, cfg.model_config.dtype)
+            cfg = self._make_vllm_config(cache_dtype="auto", model_dtype=torch.bfloat16)
+            w = NPUWorker(cfg, local_rank=0, rank=0, distributed_init_method="tcp://x")
+            self.assertEqual(w.cache_dtype, cfg.model_config.dtype)
 
-                cfg2 = self._make_vllm_config(cache_dtype="float16", model_dtype=torch.bfloat16)
-                w2 = NPUWorker(cfg2, local_rank=0, rank=0, distributed_init_method="tcp://x")
-                self.assertEqual(w2.cache_dtype, torch.float16)
-        finally:
-            if old_get_dev_props is not None:
-                torch.cuda.get_device_properties = old_get_dev_props
-
+            cfg2 = self._make_vllm_config(cache_dtype="float16", model_dtype=torch.bfloat16)
+            w2 = NPUWorker(cfg2, local_rank=0, rank=0, distributed_init_method="tcp://x")
+            self.assertEqual(w2.cache_dtype, torch.float16)
     def test_npuworker_init_enables_token_recover_only_when_ha_and_kv_consumer(self):
+        NPUWorker = _get_npu_worker_module().NPUWorker
+
         def fake_workerbase_init(
             self,
             vllm_config,
@@ -221,44 +255,37 @@ class TestNPUWorker(unittest.TestCase):
             self.distributed_init_method = distributed_init_method
             self.is_driver_worker = is_driver_worker
 
-        old_get_dev_props = getattr(torch.cuda, "get_device_properties", None)
-        try:
-            with patch(f"{MODULE}.WorkerBase.__init__", new=fake_workerbase_init), \
-                patch(
-                    f"{MODULE}.envs",
-                    _sn(
-                        VLLM_LOGGING_CONFIG_PATH=None,
-                        VLLM_USE_RAY_SPMD_WORKER=False,
-                        VLLM_ENABLE_V1_MULTIPROCESSING=False,
-                        VLLM_TORCH_PROFILER_DIR=None,
-                    ),
-                ), \
-                patch.object(NPUWorker, "_init_graph_options", lambda self: None), \
-                patch(f"{MODULE}.get_device_properties", Mock()), \
-                patch(f"{MODULE}.ENV", _sn(use_ha=True, ha_port=12345)), \
-                patch(f"{MODULE}.STR_DTYPE_TO_TORCH_DTYPE", {"float16": torch.float16, "bfloat16": torch.bfloat16}):
+        with patch(f"{MODULE}.WorkerBase.__init__", new=fake_workerbase_init), \
+            patch(
+                f"{MODULE}.envs",
+                _sn(
+                    VLLM_LOGGING_CONFIG_PATH=None,
+                    VLLM_USE_RAY_SPMD_WORKER=False,
+                    VLLM_ENABLE_V1_MULTIPROCESSING=False,
+                    VLLM_TORCH_PROFILER_DIR=None,
+                ),
+            ), \
+            patch.object(NPUWorker, "_init_graph_options", lambda self: None), \
+            patch(f"{MODULE}.get_device_properties", Mock()), \
+            patch(f"{MODULE}.ENV", _sn(use_ha=True, ha_port=12345)), \
+            patch(f"{MODULE}.STR_DTYPE_TO_TORCH_DTYPE", {"float16": torch.float16, "bfloat16": torch.bfloat16}):
 
-                cfg = self._make_vllm_config(cache_dtype="auto", kv_role="kv_consumer")
-                w = NPUWorker(cfg, local_rank=0, rank=0, distributed_init_method="tcp://x")
-                self.assertTrue(w.enable_token_recover)
+            cfg = self._make_vllm_config(cache_dtype="auto", kv_role="kv_consumer")
+            w = NPUWorker(cfg, local_rank=0, rank=0, distributed_init_method="tcp://x")
+            self.assertTrue(w.enable_token_recover)
 
-                cfg2 = self._make_vllm_config(cache_dtype="auto", kv_role="kv_producer")
-                w2 = NPUWorker(cfg2, local_rank=0, rank=0, distributed_init_method="tcp://x")
-                self.assertFalse(w2.enable_token_recover)
+            cfg2 = self._make_vllm_config(cache_dtype="auto", kv_role="kv_producer")
+            w2 = NPUWorker(cfg2, local_rank=0, rank=0, distributed_init_method="tcp://x")
+            self.assertFalse(w2.enable_token_recover)
 
-                with patch(f"{MODULE}.ENV", _sn(use_ha=False, ha_port=12345)):
-                    cfg3 = self._make_vllm_config(cache_dtype="auto", kv_role="kv_consumer")
-                    w3 = NPUWorker(cfg3, local_rank=0, rank=0, distributed_init_method="tcp://x")
-                    self.assertFalse(w3.enable_token_recover)
+            with patch(f"{MODULE}.ENV", _sn(use_ha=False, ha_port=12345)):
+                cfg3 = self._make_vllm_config(cache_dtype="auto", kv_role="kv_consumer")
+                w3 = NPUWorker(cfg3, local_rank=0, rank=0, distributed_init_method="tcp://x")
+                self.assertFalse(w3.enable_token_recover)
 
-                cfg4 = self._make_vllm_config(cache_dtype="auto", kv_role=None)
-                w4 = NPUWorker(cfg4, local_rank=0, rank=0, distributed_init_method="tcp://x")
-                self.assertFalse(w4.enable_token_recover)
-        finally:
-            if old_get_dev_props is not None:
-                torch.cuda.get_device_properties = old_get_dev_props
-
-
+            cfg4 = self._make_vllm_config(cache_dtype="auto", kv_role=None)
+            w4 = NPUWorker(cfg4, local_rank=0, rank=0, distributed_init_method="tcp://x")
+            self.assertFalse(w4.enable_token_recover)
     def test_sleep_returns_early_when_sleep_mode_unavailable(self):
         w = self._make_worker_stub()
         with patch(f"{MODULE}.NPUPlatform.is_sleep_mode_available", return_value=False), \
@@ -274,6 +301,8 @@ class TestNPUWorker(unittest.TestCase):
             mlogger.error.assert_called()
 
     def test_init_device_uses_cpu_when_no_npu_mock_set(self):
+        current_platform = _get_npu_worker_module().current_platform
+
         w = self._make_worker_stub()
         w.device_config = _sn(device=_sn(type="npu"))
         w.local_rank = 3
@@ -295,6 +324,8 @@ class TestNPUWorker(unittest.TestCase):
             mrunner.assert_called_once()
 
     def test_init_device_raises_on_unsupported_device_type(self):
+        current_platform = _get_npu_worker_module().current_platform
+
         w = self._make_worker_stub()
         w.device_config = _sn(device=_sn(type="cuda"))
         with patch.object(current_platform, "device_type", "npu"):
@@ -302,6 +333,8 @@ class TestNPUWorker(unittest.TestCase):
                 w.init_device()
 
     def test_init_device_creates_model_runner_and_profiler_and_starts_ha_server_on_rank0_when_enabled(self):
+        current_platform = _get_npu_worker_module().current_platform
+
         w = self._make_worker_stub()
         w.device_config = _sn(device=_sn(type="npu"))
         w.local_rank = 0
@@ -504,7 +537,8 @@ class TestNPUWorker(unittest.TestCase):
         )
         w.model_runner = _sn(execute_model=Mock(return_value=_IntermediateTensors({"t": 1})))
 
-        func = getattr(NPUWorker.execute_model_wrapper, "__wrapped__", NPUWorker.execute_model_wrapper)
+        worker_cls = type(w)
+        func = getattr(worker_cls.execute_model_wrapper, "__wrapped__", worker_cls.execute_model_wrapper)
 
         with patch(f"{MODULE}.get_pp_group", return_value=pp_group), \
              patch(f"{MODULE}.IntermediateTensors", _IntermediateTensors), \
@@ -524,7 +558,8 @@ class TestNPUWorker(unittest.TestCase):
         expected = _ModelRunnerOutput()
         w.model_runner = _sn(execute_model=Mock(return_value=expected))
 
-        func = getattr(NPUWorker.execute_model_wrapper, "__wrapped__", NPUWorker.execute_model_wrapper)
+        worker_cls = type(w)
+        func = getattr(worker_cls.execute_model_wrapper, "__wrapped__", worker_cls.execute_model_wrapper)
 
         with patch(f"{MODULE}.get_pp_group", return_value=pp_group), \
              patch(f"{MODULE}.IntermediateTensors", _IntermediateTensors), \
