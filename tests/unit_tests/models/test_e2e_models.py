@@ -58,6 +58,9 @@ class Test_e2e_models():
 
         self.vllm_config = creat_vllm_config(model_info.hf_config)
 
+        from omni.models.config_loader.loader import model_extra_config
+        if model_info.model_cls.__name__ == "Qwen3MoeForCausalLM":
+            model_extra_config.operator_opt_config.decode_moe_dispatch_combine = False
         # enable graph compile
         if enable_graph:
             self.vllm_config.npu_compilation_config.level = CompilationLevel.DYNAMO_AS_IS

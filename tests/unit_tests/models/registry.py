@@ -13,6 +13,7 @@ from omni.models.deepseek.deepseek_v32 import DeepseekV32ForCausalLM
 from omni.models.pangu.pangu_pro_moe_v2.pangu_moe_v2 import PanguProMoEV2ForCausalLM
 from omni.models.pangu.pangu_dense import PanguEmbeddedForCausalLM
 from omni.models.pangu.pangu_ultra_moe import PanguUltraMoEForCausalLM
+from omni.models.qwen.qwen3_moe import Qwen3MoeForCausalLM
 @dataclass(frozen=True)
 class _HfExamplesInfo:
     model_cls: type[nn.Module]
@@ -279,6 +280,44 @@ config_PanguUltraMoEForCausalLM = PretrainedConfig(
     decode_cost_time=0.0023,
     quantization_config=None,
 )
+config_Qwen3MoeForCausalLM = PretrainedConfig(
+    architectures=["Qwen3MoeForCausalLM"],
+    model_type="qwen3_moe",
+    bos_token_id=0,
+    eos_token_id=1,
+    hidden_size=1024,
+    intermediate_size=256,
+    num_hidden_layers=2,
+    num_attention_heads=8,
+    num_key_value_heads=4,
+    head_dim=128,
+    hidden_act="silu",
+    rms_norm_eps=1e-6,
+    initializer_range=0.02,
+    attention_bias=False,
+    attention_dropout=0.0,
+    max_position_embeddings=2048,
+    rope_theta=10000.0,
+    rope_scaling=None,
+    num_experts=8,
+    num_experts_per_tok=2,
+    moe_intermediate_size=256,
+    norm_topk_prob=True,
+    output_router_logits=False,
+    router_aux_loss_coef=0.001,
+    decoder_sparse_step=1,
+    max_window_layers=2,
+    mlp_only_layers=[],
+    sliding_window=None,
+    use_sliding_window=False,
+    num_nextn_predict_layers=1,
+    vocab_size=10000,
+    tie_word_embeddings=False,
+    use_cache=True,
+    torch_dtype=torch.bfloat16,
+    decode_cost_time=0.01,
+    quantization_config=None,
+)
 
 @contextmanager
 def init_patch_context_DeepseekV3ForCausalLM() -> Iterator[None]:
@@ -323,6 +362,12 @@ _TRANSFORMERS_MODELS = {
         model_cls=PanguUltraMoEForCausalLM,
         hf_config=config_PanguUltraMoEForCausalLM,
         init_patch_context_fn=init_patch_context_DeepseekV3ForCausalLM,
+        prompt_token_ids=[0, 128803, 122294, 1148, 128804, 128798, 201],
+    ),
+    "Qwen3MoeForCausalLM":_HfExamplesInfo(
+        model_cls=Qwen3MoeForCausalLM,
+        hf_config=config_Qwen3MoeForCausalLM,
+        init_patch_context_fn=None,
         prompt_token_ids=[0, 128803, 122294, 1148, 128804, 128798, 201],
     ),
 }
