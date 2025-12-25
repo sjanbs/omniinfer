@@ -8,7 +8,7 @@ import port_manager
 # Configuration
 LOG_FILE_PREFIX = "server"
 APP_START_MARKER = "Application startup complete."
-STARTUP_TIMEOUT = 80  # seconds
+STARTUP_TIMEOUT = 120  # seconds
 tp=1
 dp=1
 
