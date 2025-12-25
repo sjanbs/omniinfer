@@ -61,10 +61,7 @@ def reload_env():
     except Exception as e:
         print(f"[TEARDOWN] teardown_proxy ignored: {e}")
 
-
-# =========================
 # Case behavior helpers
-# =========================
 def apply_case_1_remove(cur_prefill, cur_decode):
     """
     Case 1: -P2 / -D1
@@ -97,10 +94,7 @@ def apply_case_4_remove_new(cur_prefill, cur_decode, p3_port, d3_port):
     cur_prefill.remove(p3_port)
     cur_decode.remove(d3_port)
 
-
-# =========================
 # Common helpers
-# =========================
 def reload_nginx(conf_path):
     proc = subprocess.run(
         f"nginx -c {conf_path} -s reload",
