@@ -319,5 +319,6 @@
     "kv_cache_scheme": null,
     "quant_method": "compressed-tensors",
     "quantization_status": "compressed"
-  }
+  },
+    "bailing_moe":{}
 }
