@@ -75,7 +75,8 @@ config_DeepseekV3ForCausalLM = PretrainedConfig(
                     "original_max_position_embeddings": 4096,
                     "type": "yarn"
                 },
-    enbale_speculative=True,
+    enable_speculative=True,
+    enable_quantization=True,
     decode_cost_time=0.0022,
     quantization_config=None # overwritten when enable_quant=True
 )
@@ -127,7 +128,8 @@ config_DeepseekV31ForCausalLM = PretrainedConfig(
     bos_token_id=0,
     eos_token_id=1,
     model_type="deepseek_v3",
-    enbale_speculative=True,
+    enable_speculative=True,
+    enable_quantization=True,
     decode_cost_time=0.0022,
     quantization_config=None,  # overwritten when enable_quant=True
 )
@@ -179,7 +181,8 @@ config_DeepseekV32ForCausalLM = PretrainedConfig(
     num_nextn_predict_layers=1,
     use_cache=True,
     torch_dtype=torch.bfloat16,
-    enbale_speculative=True,
+    enable_speculative=True,
+    enable_quantization=True,
     decode_cost_time=0.0022,
     quantization_config=None
 )
@@ -208,7 +211,8 @@ config_PanguEmbeddedForCausalLM = PretrainedConfig(
     tie_word_embeddings=False,
     use_cache=True,
     torch_dtype=torch.bfloat16,
-    enbale_speculative=True,
+    enable_speculative=True,
+    enable_quantization=True,
     decode_cost_time=0.0023,
     quantization_config=None,
 )
@@ -249,7 +253,8 @@ config_PanguProMoEV2ForCausalLM = PretrainedConfig(
     use_cache=True,
     torch_dtype=torch.bfloat16,
     vocab_size=10000,
-    enbale_speculative=True,
+    enable_speculative=True,
+    enable_quantization=True,
     decode_cost_time=0.0023,
     quantization_config=None
 )
@@ -284,7 +289,8 @@ config_PanguUltraMoEForCausalLM = PretrainedConfig(
     tie_word_embeddings=False,
     use_cache=True,
     torch_dtype=torch.bfloat16,
-    enbale_speculative=True,
+    enable_speculative=True,
+    enable_quantization=True,
     decode_cost_time=0.0023,
     quantization_config=None,
 )
@@ -323,7 +329,8 @@ config_Qwen3MoeForCausalLM = PretrainedConfig(
     tie_word_embeddings=False,
     use_cache=True,
     torch_dtype=torch.bfloat16,
-    enbale_speculative=True,
+    enable_speculative=True,
+    enable_quantization=True,
     decode_cost_time=0.022,
     quantization_config=None,
 )
@@ -353,7 +360,8 @@ config_Qwen3ForCausalLM = PretrainedConfig(
     use_sliding_window=False,
     use_cache=True,
     torch_dtype=torch.bfloat16,
-    enbale_speculative=False,
+    enable_speculative=False,
+    enable_quantization=True,
     decode_cost_time=0.022,
     quantization_config=None,
 )
@@ -400,7 +408,8 @@ config_BailingMoeV2ForCausalLM = PretrainedConfig(
     output_dropout=0.0,
     use_cache=True,
     torch_dtype=torch.bfloat16,
-    enbale_speculative=False,
+    enable_speculative=False,
+    enable_quantization=False,
     decode_cost_time=0.01,
     quantization_config=None,
 )
