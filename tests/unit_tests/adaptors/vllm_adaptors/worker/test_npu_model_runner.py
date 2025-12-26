@@ -265,6 +265,19 @@ class FakeModel(torch.nn.Module):
     __call__ = forward
 
 
+class FakeLogitModel(FakeModel):
+    def compute_logits(self, hidden_states, _):
+        return torch.zeros((hidden_states.shape[0], 5), device=hidden_states.device, dtype=hidden_states.dtype)
+
+
+class FakeTupleModel(FakeModel):
+    def forward(self, input_ids=None, positions=None, intermediate_tensors=None, inputs_embeds=None, **kwargs):
+        token_shape = inputs_embeds.shape[0] if inputs_embeds is not None else input_ids.shape[0]
+        raw = torch.ones((token_shape, self.hidden_size), device=positions.device, dtype=torch.float16)
+        hidden = torch.zeros((token_shape, self.hidden_size), device=positions.device, dtype=torch.float16)
+        return raw, hidden
+
+
 class RecordingDummyBuilder(DummyAttentionMetadataBuilder):
     def __init__(self, device):
         self.device = device
@@ -1107,6 +1120,168 @@ def test_kv_connector_no_forward_returns_output(monkeypatch, parallel_state, sam
     assert output.finished_sending == {"req0"}
     assert output.finished_recving == {"req1"}
 
+
+def test_execute_model_basic_flow(monkeypatch, parallel_state, sampler_and_drafter, npu_device):
+    # execute_model should run sampling and return ModelRunnerOutput for basic decode.
+    model_cfg = DummyModelConfig()
+    cache_cfg = DummyCacheConfig()
+    sched_cfg = DummySchedulerConfig(num_step=1)
+    parallel_cfg = DummyParallelConfig()
+    npu_comp_cfg = DummyNPUCompilationConfig()
+
+    vllm_cfg = make_vllm_config(
+        model_config=model_cfg,
+        cache_config=cache_cfg,
+        scheduler_config=sched_cfg,
+        parallel_config=parallel_cfg,
+        npu_compilation_config=npu_comp_cfg,
+        spec_config=None,
+        kv_role=None,
+        additional_config={},
+    )
+    runner = NPUModelRunner(vllm_cfg, npu_device)
+    runner.model = FakeLogitModel(hidden_size=runner.hidden_size).to(npu_device)
+    runner.sampler = FakeSampler()
+    runner.attn_metadata_builders = [SimpleNamespace(_num_decodes=1, _num_prefills=0)]
+    runner.use_spec_decode = False
+
+    req_ids = ["req0"]
+    runner.input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        req_id_to_index={"req0": 0},
+        sampling_metadata=SimpleNamespace(batch_size=1),
+        generators={},
+        vocab_size=32,
+        num_prompt_logprobs={"req0": 1},
+    )
+    runner.requests = {"req0": SimpleNamespace(num_computed_tokens=0, num_tokens=1)}
+
+    positions = torch.zeros(1, dtype=torch.int64, device=npu_device)
+    attn_metadata = {"layers.0.attn": SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly)}
+    sample_indices = torch.tensor([0], dtype=torch.int64, device=npu_device)
+
+    monkeypatch.setattr(runner, "_update_states", lambda *_: None)
+    monkeypatch.setattr(runner, "_prepare_kv_cache", lambda *_: None)
+    monkeypatch.setattr(
+        runner,
+        "_prepare_inputs",
+        lambda *_: (attn_metadata, 0, sample_indices, positions, None),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_execute_model",
+        lambda *_: (
+            torch.zeros((1, runner.hidden_size), device=npu_device, dtype=torch.float16),
+            torch.zeros((1, runner.hidden_size), device=npu_device, dtype=torch.float16),
+            torch.zeros((1,), device=npu_device, dtype=torch.int64),
+            {"req0"},
+            {"req1"},
+        ),
+    )
+
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=1,
+        num_scheduled_tokens={"req0": 1},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[0],
+        scheduled_new_reqs=[SimpleNamespace(sampling_params=SimpleNamespace(prompt_logprobs=True))],
+        finished_req_ids=[],
+        grammar_bitmask=None,
+        num_step=1,
+    )
+
+    output = runner.execute_model(scheduler_output)
+    assert output.sampled_token_ids == [[0]]
+    assert output.prompt_logprobs_dict.get("req0") is not None
+    assert output.finished_sending == {"req0"}
+    assert output.finished_recving == {"req1"}
+
+
+def test_execute_model_returns_empty_when_no_work(monkeypatch, parallel_state, sampler_and_drafter, npu_device):
+    # execute_model should return EMPTY_MODEL_RUNNER_OUTPUT when no tokens scheduled and no KV transfer.
+    model_cfg = DummyModelConfig()
+    cache_cfg = DummyCacheConfig()
+    sched_cfg = DummySchedulerConfig()
+    parallel_cfg = DummyParallelConfig()
+    npu_comp_cfg = DummyNPUCompilationConfig()
+
+    vllm_cfg = make_vllm_config(
+        model_config=model_cfg,
+        cache_config=cache_cfg,
+        scheduler_config=sched_cfg,
+        parallel_config=parallel_cfg,
+        npu_compilation_config=npu_comp_cfg,
+        spec_config=None,
+        kv_role=None,
+        additional_config={},
+    )
+    runner = NPUModelRunner(vllm_cfg, npu_device)
+
+    monkeypatch.setattr(runner, "_update_states", lambda *_: None)
+    monkeypatch.setattr(runner, "_prepare_kv_cache", lambda *_: None)
+    monkeypatch.setattr("omni.adaptors.vllm.worker.npu_model_runner.has_kv_transfer_group", lambda: False)
+
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=0,
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[0],
+        scheduled_new_reqs=[],
+        finished_req_ids=[],
+        grammar_bitmask=None,
+        num_step=1,
+    )
+
+    output = runner.execute_model(scheduler_output)
+    assert output is not None
+
+
+def test_execute_model_internal_execute(monkeypatch, parallel_state, sampler_and_drafter, npu_device):
+    # _execute_model should return padded input ids and propagate finished transfer sets.
+    model_cfg = DummyModelConfig()
+    cache_cfg = DummyCacheConfig()
+    sched_cfg = DummySchedulerConfig()
+    parallel_cfg = DummyParallelConfig()
+    npu_comp_cfg = DummyNPUCompilationConfig()
+
+    vllm_cfg = make_vllm_config(
+        model_config=model_cfg,
+        cache_config=cache_cfg,
+        scheduler_config=sched_cfg,
+        parallel_config=parallel_cfg,
+        npu_compilation_config=npu_comp_cfg,
+        spec_config=None,
+        kv_role=None,
+        additional_config={},
+    )
+    runner = NPUModelRunner(vllm_cfg, npu_device)
+    runner.model = FakeTupleModel(hidden_size=runner.hidden_size).to(npu_device)
+    runner.kv_caches = []
+    runner.enable_torchair_graph_mode = False
+
+    attn_metadata = {"layers.0.attn": SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly)}
+    positions = runner.positions[:1]
+    sample_indices = torch.tensor([0], dtype=torch.int64, device=npu_device)
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
+
+    monkeypatch.setattr(runner, "maybe_setup_kv_connector", lambda *_: None)
+    monkeypatch.setattr(runner, "maybe_wait_for_kv_save", lambda *_: None)
+    monkeypatch.setattr(runner, "get_finished_kv_transfers", lambda *_: ({"req0"}, {"req1"}))
+
+    hidden_states, raw_hidden_states, input_ids, finished_sending, finished_recving = runner._execute_model(
+        scheduler_output,
+        attn_metadata,
+        graph_pad_size=1,
+        sample_indices=sample_indices,
+        positions=positions,
+        intermediate_tensors=None,
+    )
+
+    assert hidden_states.shape[0] == 2
+    assert raw_hidden_states.shape[0] == 2
+    assert input_ids.shape[0] == 2
+    assert finished_sending == {"req0"}
+    assert finished_recving == {"req1"}
 def test_dummy_run_profile_no_kv_caches_spec_decode(parallel_state, sampler_and_drafter, npu_device):
     # _dummy_run should run the model and invoke drafter when spec decode is enabled.
     model_cfg = DummyModelConfig()
