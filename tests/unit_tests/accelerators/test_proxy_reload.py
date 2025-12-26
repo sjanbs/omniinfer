@@ -175,12 +175,7 @@ def rewrite_upstream_servers_only(conf_path, upstream_name, new_ports):
     with open(conf_path, "w") as f:
         f.writelines(new_lines)
 
-
 def wait_vllm_ready(processes, logs, timeout=60):
-    """
-    Wait until all vLLM mock processes report 'Application startup complete.'
-    and none of them exits prematurely.
-    """
     start = time.time()
     ready = [False] * len(processes)
 
@@ -204,20 +199,35 @@ def wait_vllm_ready(processes, logs, timeout=60):
 
 
 COMPLETE_MARK = "Upstream initialization completed"
-
-
-def wait_reload_complete_from_log(error_log: Path, start_pos: int, timeout=30):
+def wait_reload_complete_from_log(
+    error_log: Path,
+    start_pos: int,
+    proxy_port: int,
+    timeout: int = 30,
+):
     start = time.time()
+
     while time.time() - start < timeout:
+        # 条件 1：看到 reload 完成日志
         if error_log.exists():
             with open(error_log, "r") as f:
                 f.seek(start_pos)
-                logs = f.read()
-            if COMPLETE_MARK in logs:
-                return
-        time.sleep(0.5)
-    pytest.fail("reload did not complete")
+                if COMPLETE_MARK in f.read():
+                    return
 
+        # 条件 2：proxy health 恢复
+        try:
+            r = requests.get(
+                f"http://127.0.0.1:{proxy_port}/omni_proxy/health",
+                timeout=2,
+            )
+            if r.status_code == 200:
+                return
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+    raise RuntimeError("reload did not complete")
 
 def get_nginx_pids(tag=""):
     out = subprocess.check_output(
@@ -239,7 +249,6 @@ def get_nginx_pids(tag=""):
     print(f"  master : {master}")
     print(f"  workers: {workers}")
     return master, workers
-
 
 def _response_body_is_valid_json_or_sse_json(r) -> bool:
     body = (r.text or "").strip()
@@ -275,7 +284,6 @@ def test_proxy_reload(reload_env):
     proxy_port = reload_env["proxy_port"]
     prefill_port_list = reload_env["prefill_ports"]
     decode_port_list = reload_env["decode_ports"]
-
     """
     Health-based proxy reload test (enhanced).
 
@@ -293,13 +301,11 @@ def test_proxy_reload(reload_env):
         * master PID unchanged
     - nginx.conf must be restored after test
     """
-
     SELECT_CASE = os.getenv("RELOAD_CASE")
     if SELECT_CASE:
         print(f"[RELOAD_CASE] Only running Case {SELECT_CASE}")
-
     conf_path = "/usr/local/nginx/conf/nginx.conf"
-    error_log = Path.cwd() / "nginx_error.log"
+    error_log = Path(__file__).resolve().parent / "nginx_error.log"
 
     NGINX_CRASH_KEYWORDS = [
         "exited on signal",
@@ -396,7 +402,7 @@ def test_proxy_reload(reload_env):
             rewrite_upstream_servers_only(conf_path, "decode_endpoints", cur_decode)
 
             reload_nginx(conf_path)
-            wait_reload_complete_from_log(error_log, log_pos)
+            wait_reload_complete_from_log(error_log, log_pos, proxy_port)
             time.sleep(0.5)
             wait_proxy_health(proxy_port)
 
@@ -500,7 +506,6 @@ def test_proxy_reload(reload_env):
         if new_processes:
             cleanup_subprocess(new_processes)
 
-
 def test_proxy_reload_under_concurrent_traffic(reload_env):
     """
     Concurrent traffic + multi-round real reload stability test.
@@ -524,7 +529,6 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
     - Any request timeout is treated as a failure.
     - All requests must return HTTP 200.
     """
-
     proxy_port = reload_env["proxy_port"]
 
     base_prefill = reload_env["prefill_ports"].copy()
@@ -624,7 +628,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
 
             time.sleep(1.0)
             reload_nginx(conf_path)
-            wait_reload_complete_from_log(error_log, log_pos)
+            wait_reload_complete_from_log(error_log, log_pos, proxy_port)
             time.sleep(0.5)
             wait_proxy_health(proxy_port)
 
@@ -662,7 +666,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
 
                 time.sleep(1.0)
                 reload_nginx(conf_path)
-                wait_reload_complete_from_log(error_log, log_pos)
+                wait_reload_complete_from_log(error_log, log_pos, proxy_port)
                 time.sleep(0.5)
                 wait_proxy_health(proxy_port)
 
@@ -701,7 +705,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
 
                 time.sleep(1.0)
                 reload_nginx(conf_path)
-                wait_reload_complete_from_log(error_log, log_pos)
+                wait_reload_complete_from_log(error_log, log_pos, proxy_port)
                 time.sleep(0.5)
                 wait_proxy_health(proxy_port)
 
@@ -755,7 +759,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
 
                 time.sleep(1.0)
                 reload_nginx(conf_path)
-                wait_reload_complete_from_log(error_log, log_pos)
+                wait_reload_complete_from_log(error_log, log_pos, proxy_port)
                 time.sleep(0.5)
                 wait_proxy_health(proxy_port)
 
@@ -795,7 +799,7 @@ def test_proxy_reload_under_concurrent_traffic(reload_env):
 
                 time.sleep(1.0)
                 reload_nginx(conf_path)
-                wait_reload_complete_from_log(error_log, log_pos)
+                wait_reload_complete_from_log(error_log, log_pos, proxy_port)
                 time.sleep(0.5)
                 wait_proxy_health(proxy_port)
 
