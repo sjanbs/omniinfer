@@ -70,7 +70,7 @@ class Test_e2e_models():
             quant_configs = load_configs(config_mode="quantization_config", required_key=required_key)
             self.vllm_config.model_config.hf_config.quantization_config = AscendCompressedTensorsConfig.from_config(quant_configs)
 
-        if self.vllm_config.model_config.hf_config.enbale_speculative:
+        if self.vllm_config.model_config.hf_config.enable_speculative:
             self.vllm_config.speculative_config = get_speculative_config()
             decode_bsz = 1 + self.vllm_config.speculative_config.num_speculative_tokens
             self.vllm_config.scheduler_config.max_batch_size *= decode_bsz
