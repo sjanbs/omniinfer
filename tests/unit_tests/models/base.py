@@ -25,7 +25,7 @@ from vllm.v1.worker.block_table import BlockTable
 from omni.adaptors.vllm.forward_context import set_forward_context
 from omni.layers.attention.backend.attention import AscendAttentionState
 from omni.layers.attention.backend.attention_dummy_builder import DummyAttentionMetadataBuilder
-
+from omni.accelerators.reasoning_compression.config import ThinkCompressDict
 from omni.adaptors.vllm.worker.npu_model_runner import GraphCompileConfiguration, mark_static_for_graph_default
 
 __origin_get_device_properties__ = torch.npu.get_device_properties
@@ -129,6 +129,7 @@ class MockRunner:
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+        ThinkCompressDict.reasoner_early_think_stopping_enabled = 0  
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
