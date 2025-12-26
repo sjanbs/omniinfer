@@ -45,7 +45,7 @@ class Test_e2e_models():
         assert filtered_times <= float(threshold) * 1.05, f"Model:{model_type} the inference latency \
             {filtered_times} exceeds threshold {float(threshold) *1.05}"
 
-    def _model_runner(self, local_rank: int, world_size: int, model_info, enable_graph, enable_quant):
+    def _model_runner(self, local_rank: int, world_size: int, model_info, enable_graph):
 
         os.environ["GLOO_SOCKET_IFNAME"] = os.environ.get(
             "GLOO_SOCKET_IFNAME", "enp23s0f3"
@@ -65,7 +65,7 @@ class Test_e2e_models():
         if enable_graph:
             self.vllm_config.npu_compilation_config.level = CompilationLevel.DYNAMO_AS_IS
 
-        if enable_quant:
+        if self.vllm_config.model_config.hf_config.enable_quantization:
             required_key = self.vllm_config.model_config.hf_config.model_type
             quant_configs = load_configs(config_mode="quantization_config", required_key=required_key)
             self.vllm_config.model_config.hf_config.quantization_config = AscendCompressedTensorsConfig.from_config(quant_configs)
@@ -127,16 +127,15 @@ class Test_e2e_models():
         else:
             assert forward_results.shape == torch.Size([self.vllm_config.scheduler_config.max_batch_size, self.vllm_config.model_config.hf_config.hidden_size])
 
-        if enable_graph and enable_quant:
+        if enable_graph:
             self._latency_test(num_tokens=num_tokens, 
                                model_type=self.vllm_config.model_config.hf_config.model_type, 
                                threshold=self.vllm_config.model_config.hf_config.decode_cost_time)
 
-    @pytest.mark.parametrize("enable_quant", [False, True])
     @pytest.mark.parametrize("enable_graph", [False, True])
     @pytest.mark.parametrize("world_size", [1])
     @pytest.mark.parametrize("model_arch", HF_EXAMPLE_MODELS.get_supported_archs())
-    def test_model(self, world_size: int, model_arch: str, enable_graph: bool, enable_quant: bool):
+    def test_model(self, world_size: int, model_arch: str, enable_graph: bool):
         model_info = HF_EXAMPLE_MODELS.get_hf_info(model_arch)
 
         with tempfile.NamedTemporaryFile(delete=False) as tfile:
@@ -145,7 +144,7 @@ class Test_e2e_models():
         try:
             mp.spawn(
                 self._model_runner,
-                args=(world_size, model_info, enable_graph, enable_quant),
+                args=(world_size, model_info, enable_graph),
                 nprocs=world_size,
             )
         finally:
