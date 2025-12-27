@@ -57,23 +57,24 @@ bash build.sh --skip-extras -c
 unset http_proxy
 unset https_proxy
 
-marker_args=()
 target_path="${SCRIPT_DIR}"
 report_name="pytest-all.xml"
 
+unit_path="${SCRIPT_DIR}/unit_tests"
+integrated_path="${SCRIPT_DIR}/integrated_tests"
+
 case "${target}" in
   unit)
-    target_path="${SCRIPT_DIR}/unit_tests"
+    target_path="${unit_path}"
     report_name="pytest-unit.xml"
     ;;
   integrated)
-    marker_args=(-m "integrated and not gpu")
-    target_path="${SCRIPT_DIR}/integrated_tests"
+    target_path="${integrated_path}"
     report_name="pytest-integrated.xml"
     ;;
   all)
-    marker_args=(-m "not gpu")
-    ;; # run everything except GPU-tagged cases
+    target_path="${unit_path} ${integrated_path}"
+    ;;
   *)
     log_warn "Unknown target '${target}', defaulting to all tests."
     ;;
@@ -81,7 +82,6 @@ esac
 
 cmd=(
   pytest 
-  "${marker_args[@]}" 
   --tb=no -v
   "${target_path}"
   --cov
